@@ -13,38 +13,35 @@ import (
 	"google.golang.org/adk/agent/llmagent"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/tool"
+	"google.golang.org/genai"
 )
 
 // ExpertAgentBuilder 专家 Agent 构建器
 type ExpertAgentBuilder struct {
 	llm          model.LLM
+	aiConfig     *models.AIConfig // AI 配置（包含 temperature、maxTokens）
 	toolRegistry *tools.Registry
 	mcpManager   *mcp.Manager
 }
 
 // NewExpertAgentBuilder 创建专家 Agent 构建器
-func NewExpertAgentBuilder(llm model.LLM) *ExpertAgentBuilder {
-	return &ExpertAgentBuilder{llm: llm}
+func NewExpertAgentBuilder(llm model.LLM, aiConfig *models.AIConfig) *ExpertAgentBuilder {
+	return &ExpertAgentBuilder{llm: llm, aiConfig: aiConfig}
 }
 
 // NewExpertAgentBuilderWithTools 创建带工具的专家 Agent 构建器
-func NewExpertAgentBuilderWithTools(llm model.LLM, registry *tools.Registry) *ExpertAgentBuilder {
-	return &ExpertAgentBuilder{llm: llm, toolRegistry: registry}
+func NewExpertAgentBuilderWithTools(llm model.LLM, aiConfig *models.AIConfig, registry *tools.Registry) *ExpertAgentBuilder {
+	return &ExpertAgentBuilder{llm: llm, aiConfig: aiConfig, toolRegistry: registry}
 }
 
 // NewExpertAgentBuilderFull 创建完整配置的专家 Agent 构建器
-func NewExpertAgentBuilderFull(llm model.LLM, registry *tools.Registry, mcpMgr *mcp.Manager) *ExpertAgentBuilder {
-	return &ExpertAgentBuilder{llm: llm, toolRegistry: registry, mcpManager: mcpMgr}
-}
-
-// BuildAgent 根据配置构建 LLM Agent
-func (b *ExpertAgentBuilder) BuildAgent(config *models.AgentConfig, stock *models.Stock, query string, position *models.StockPosition) (agent.Agent, error) {
-	return b.BuildAgentWithContext(config, stock, query, "", position)
+func NewExpertAgentBuilderFull(llm model.LLM, aiConfig *models.AIConfig, registry *tools.Registry, mcpMgr *mcp.Manager) *ExpertAgentBuilder {
+	return &ExpertAgentBuilder{llm: llm, aiConfig: aiConfig, toolRegistry: registry, mcpManager: mcpMgr}
 }
 
 // BuildAgentWithContext 根据配置构建 LLM Agent（支持引用上下文）
-func (b *ExpertAgentBuilder) BuildAgentWithContext(config *models.AgentConfig, stock *models.Stock, query string, replyContent string, position *models.StockPosition) (agent.Agent, error) {
-	instruction := b.buildInstructionWithContext(config, stock, query, replyContent, position)
+func (b *ExpertAgentBuilder) BuildAgentWithContext(config *models.AgentConfig, stock *models.Stock, query string, replyContent string, coreContext string, position *models.StockPosition) (agent.Agent, error) {
+	instruction := b.buildInstructionWithContext(config, stock, query, replyContent, coreContext, position)
 
 	// 获取 Agent 配置的工具
 	var agentTools []tool.Tool
@@ -55,26 +52,40 @@ func (b *ExpertAgentBuilder) BuildAgentWithContext(config *models.AgentConfig, s
 	// 获取 MCP toolsets
 	var toolsets []tool.Toolset
 	if b.mcpManager != nil && len(config.MCPServers) > 0 {
+		log.Info("Agent %s 请求 MCP servers: %v", config.ID, config.MCPServers)
 		toolsets = b.mcpManager.GetToolsetsByIDs(config.MCPServers)
+		log.Info("Agent %s 获取到 %d 个 toolsets", config.ID, len(toolsets))
+		// 打印每个 toolset 的名称
+		for i, ts := range toolsets {
+			log.Info("Agent %s toolset[%d]: %s", config.ID, i, ts.Name())
+		}
+	}
+
+	// 构建生成配置（应用 temperature 和 maxTokens）
+	var generateConfig *genai.GenerateContentConfig
+	if b.aiConfig != nil {
+		temp := float32(b.aiConfig.Temperature)
+		generateConfig = &genai.GenerateContentConfig{
+			Temperature: &temp,
+		}
+		if b.aiConfig.MaxTokens > 0 {
+			generateConfig.MaxOutputTokens = int32(b.aiConfig.MaxTokens)
+		}
 	}
 
 	return llmagent.New(llmagent.Config{
-		Name:        config.ID,
-		Model:       b.llm,
-		Description: config.Role,
-		Instruction: instruction,
-		Tools:       agentTools,
-		Toolsets:    toolsets,
+		Name:                  config.ID,
+		Model:                 b.llm,
+		Description:           config.Role,
+		Instruction:           instruction,
+		Tools:                 agentTools,
+		Toolsets:              toolsets,
+		GenerateContentConfig: generateConfig,
 	})
 }
 
-// buildInstruction 构建 Agent 指令
-func (b *ExpertAgentBuilder) buildInstruction(config *models.AgentConfig, stock *models.Stock, query string, position *models.StockPosition) string {
-	return b.buildInstructionWithContext(config, stock, query, "", position)
-}
-
 // buildInstructionWithContext 构建 Agent 指令（支持引用上下文）
-func (b *ExpertAgentBuilder) buildInstructionWithContext(config *models.AgentConfig, stock *models.Stock, query string, replyContent string, position *models.StockPosition) string {
+func (b *ExpertAgentBuilder) buildInstructionWithContext(config *models.AgentConfig, stock *models.Stock, query string, replyContent string, coreContext string, position *models.StockPosition) string {
 	baseInstruction := config.Instruction
 	if baseInstruction == "" {
 		baseInstruction = fmt.Sprintf("你是一位%s，名字是%s。", config.Role, config.Name)
@@ -111,6 +122,17 @@ func (b *ExpertAgentBuilder) buildInstructionWithContext(config *models.AgentCon
 当前时间: %s
 市场状态: %s
 
+## 工具调用规范
+当你需要调用工具时，必须通过系统提供的标准 function call 机制进行调用。
+**重要：需要调用工具时，不要在工具调用前输出任何思考过程或分析文字，直接发起工具调用。工具返回结果后，再基于结果组织你的回答。**
+禁止在回复文本中输出任何自定义的工具调用标签，包括但不限于：
+- <tool_call>、</tool_call>
+- <tool_call_begin>、</tool_call_end>
+- <invoke>、</invoke>
+- <tool>、</tool>
+- 任何类似 <xxx:tool_call> 格式的标签
+直接使用 API 提供的 tool_calls 功能，不要在文本中模拟工具调用。
+
 股票: %s (%s)
 当前价格: %.2f
 涨跌幅: %.2f%%
@@ -131,17 +153,24 @@ func (b *ExpertAgentBuilder) buildInstructionWithContext(config *models.AgentCon
 `, position.Shares, position.CostPrice, marketValue, profitLoss, profitPercent)
 	}
 
+	if strings.TrimSpace(coreContext) != "" {
+		prompt += fmt.Sprintf(`
+【核心数据包】
+%s
+`, coreContext)
+	}
+
 	// 如果有引用内容，加入上下文
 	if replyContent != "" {
 		prompt += fmt.Sprintf(`--- 引用的观点 ---
 %s
 ---
 
-小韭菜问题: %s
+你的分析任务: %s
 
-请结合以上引用的观点，发表你的看法。可以赞同、补充或反驳。回复控制在150字以内。`, replyContent, query)
+请结合以上引用的观点，发表你的专业看法。可以赞同、补充或反驳。回复控制在150字以内。`, replyContent, query)
 	} else {
-		prompt += fmt.Sprintf(`小韭菜问题: %s
+		prompt += fmt.Sprintf(`你的分析任务: %s
 
 请用简洁专业的语言回答，控制在150字以内。`, query)
 	}
@@ -151,9 +180,9 @@ func (b *ExpertAgentBuilder) buildInstructionWithContext(config *models.AgentCon
 
 // buildToolsDescription 构建可用工具说明
 func (b *ExpertAgentBuilder) buildToolsDescription(config *models.AgentConfig) string {
-	var searchTools []string    // 搜索类工具
-	var dataTools []string      // 数据查询工具
-	var otherTools []string     // 其他工具
+	var searchTools []string // 搜索类工具
+	var dataTools []string   // 数据查询工具
+	var otherTools []string  // 其他工具
 
 	// 搜索类工具关键词
 	searchKeywords := []string{"search", "搜索", "web", "网页", "tavily", "google", "bing"}

@@ -2,13 +2,21 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"iter"
+	"strings"
 
 	"github.com/sashabaranov/go-openai"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
+
+	"github.com/run-bigpig/jcp/internal/logger"
 )
+
+var modelLog = logger.New("openai:model")
 
 var _ model.LLM = &OpenAIModel{}
 
@@ -18,16 +26,20 @@ var (
 
 // OpenAIModel 实现 model.LLM 接口，支持 thinking 模型
 type OpenAIModel struct {
-	Client    *openai.Client
-	ModelName string
+	Client         *openai.Client
+	ModelName      string
+	TokenParamMode string
+	NoSystemRole   bool // 不支持 system role 时需要降级处理
 }
 
 // NewOpenAIModel 创建 OpenAI 模型
-func NewOpenAIModel(modelName string, cfg openai.ClientConfig) *OpenAIModel {
+func NewOpenAIModel(modelName string, cfg openai.ClientConfig, noSystemRole bool, tokenParamMode string) *OpenAIModel {
 	client := openai.NewClientWithConfig(cfg)
 	return &OpenAIModel{
-		Client:    client,
-		ModelName: modelName,
+		Client:         client,
+		ModelName:      modelName,
+		TokenParamMode: tokenParamMode,
+		NoSystemRole:   noSystemRole,
 	}
 }
 
@@ -47,13 +59,20 @@ func (o *OpenAIModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 // generate 非流式生成
 func (o *OpenAIModel) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName)
+		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName, o.NoSystemRole, o.TokenParamMode)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
 
 		resp, err := o.Client.CreateChatCompletion(ctx, openaiReq)
+		if err != nil {
+			retryReq, ok := buildCompatRetryRequest(openaiReq, err)
+			if ok {
+				modelLog.Warn("模型 [%s] 首次请求参数不兼容，已自动调整后重试: %v", o.ModelName, err)
+				resp, err = o.Client.CreateChatCompletion(ctx, retryReq)
+			}
+		}
 		if err != nil {
 			yield(nil, err)
 			return
@@ -72,7 +91,7 @@ func (o *OpenAIModel) generate(ctx context.Context, req *model.LLMRequest) iter.
 // generateStream 流式生成
 func (o *OpenAIModel) generateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName)
+		openaiReq, err := toOpenAIChatCompletionRequest(req, o.ModelName, o.NoSystemRole, o.TokenParamMode)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -80,6 +99,14 @@ func (o *OpenAIModel) generateStream(ctx context.Context, req *model.LLMRequest)
 		openaiReq.Stream = true
 
 		stream, err := o.Client.CreateChatCompletionStream(ctx, openaiReq)
+		if err != nil {
+			retryReq, ok := buildCompatRetryRequest(openaiReq, err)
+			if ok {
+				retryReq.Stream = true
+				modelLog.Warn("模型 [%s] 首次流式请求参数不兼容，已自动调整后重试: %v", o.ModelName, err)
+				stream, err = o.Client.CreateChatCompletionStream(ctx, retryReq)
+			}
+		}
 		if err != nil {
 			yield(nil, err)
 			return
@@ -98,17 +125,41 @@ func (o *OpenAIModel) processStream(stream *openai.ChatCompletionStream, yield f
 	}
 	var finishReason genai.FinishReason
 	var usageMetadata *genai.GenerateContentResponseUsageMetadata
-	toolCallsMap := make(map[int]*toolCallBuilder)
+	toolCalls := newChatStreamToolCallAggregator()
 	var textContent string
-	var reasoningContent string
+	var thoughtContent string
+	thinkParser := newThinkTagStreamParser()
 
+	emitPartial := func(seg thinkSegment) bool {
+		if seg.Text == "" {
+			return true
+		}
+		if seg.Thought {
+			thoughtContent += seg.Text
+		} else {
+			textContent += seg.Text
+		}
+
+		part := &genai.Part{Text: seg.Text, Thought: seg.Thought}
+		llmResp := &model.LLMResponse{
+			Content:      &genai.Content{Role: "model", Parts: []*genai.Part{part}},
+			Partial:      true,
+			TurnComplete: false,
+		}
+		return yield(llmResp, nil)
+	}
+
+	var streamErr error
 	for {
 		chunk, err := stream.Recv()
 		if errors.Is(err, context.Canceled) {
 			return
 		}
 		if err != nil {
-			// 流结束
+			if !errors.Is(err, io.EOF) {
+				streamErr = fmt.Errorf("流式读取错误: %w", err)
+				modelLog.Warn("流式读取中断: %v", err)
+			}
 			break
 		}
 
@@ -118,62 +169,32 @@ func (o *OpenAIModel) processStream(stream *openai.ChatCompletionStream, yield f
 
 		choice := chunk.Choices[0]
 
-		// 处理 reasoning_content (thinking 模型)
+		// 官方 reasoning_content -> Thought
 		if choice.Delta.ReasoningContent != "" {
-			reasoningContent += choice.Delta.ReasoningContent
-			// 发送 thinking 部分
-			part := &genai.Part{Text: choice.Delta.ReasoningContent, Thought: true}
-			llmResp := &model.LLMResponse{
-				Content:      &genai.Content{Role: "model", Parts: []*genai.Part{part}},
-				Partial:      true,
-				TurnComplete: false,
-			}
-			if !yield(llmResp, nil) {
+			if !emitPartial(thinkSegment{
+				Text:    choice.Delta.ReasoningContent,
+				Thought: true,
+			}) {
 				return
 			}
 		}
 
-		// 处理普通文本内容
-		if choice.Delta.Content != "" {
-			textContent += choice.Delta.Content
-			part := &genai.Part{Text: choice.Delta.Content}
-			llmResp := &model.LLMResponse{
-				Content:      &genai.Content{Role: "model", Parts: []*genai.Part{part}},
-				Partial:      true,
-				TurnComplete: false,
-			}
-			if !yield(llmResp, nil) {
+		// content 中的 <think>...</think> -> Thought
+		for _, seg := range thinkParser.Feed(choice.Delta.Content) {
+			if !emitPartial(seg) {
 				return
 			}
 		}
 
-		// 处理工具调用
-		for _, toolCall := range choice.Delta.ToolCalls {
-			idx := 0
-			if toolCall.Index != nil {
-				idx = *toolCall.Index
-			}
-
-			if _, exists := toolCallsMap[idx]; !exists {
-				toolCallsMap[idx] = &toolCallBuilder{}
-			}
-
-			builder := toolCallsMap[idx]
-			if toolCall.ID != "" {
-				builder.id = toolCall.ID
-			}
-			if toolCall.Function.Name != "" {
-				builder.name = toolCall.Function.Name
-			}
-			builder.args += toolCall.Function.Arguments
+		// 处理标准工具调用
+		for pos, toolCall := range choice.Delta.ToolCalls {
+			toolCalls.AddDelta(pos, toolCall)
 		}
 
-		// 处理结束原因
 		if choice.FinishReason != "" {
 			finishReason = convertFinishReason(string(choice.FinishReason))
 		}
 
-		// 处理 usage
 		if chunk.Usage != nil {
 			usageMetadata = &genai.GenerateContentResponseUsageMetadata{
 				PromptTokenCount:     int32(chunk.Usage.PromptTokens),
@@ -183,33 +204,54 @@ func (o *OpenAIModel) processStream(stream *openai.ChatCompletionStream, yield f
 		}
 	}
 
-	// 添加聚合的文本内容
-	if textContent != "" {
-		aggregatedContent.Parts = append(aggregatedContent.Parts, &genai.Part{Text: textContent})
-	}
-
-	// 添加 reasoning content 作为 thought part
-	if reasoningContent != "" {
-		aggregatedContent.Parts = append([]*genai.Part{{Text: reasoningContent, Thought: true}}, aggregatedContent.Parts...)
-	}
-
-	// 添加工具调用
-	if len(toolCallsMap) > 0 {
-		indices := sortedKeys(toolCallsMap)
-		for _, idx := range indices {
-			builder := toolCallsMap[idx]
-			part := &genai.Part{
-				FunctionCall: &genai.FunctionCall{
-					ID:   builder.id,
-					Name: builder.name,
-					Args: parseJSONArgs(builder.args),
-				},
-			}
-			aggregatedContent.Parts = append(aggregatedContent.Parts, part)
+	// 刷新流式标签解析器（处理标签跨 chunk 场景）
+	for _, seg := range thinkParser.Flush() {
+		if !emitPartial(seg) {
+			return
 		}
 	}
 
-	// 发送最终响应
+	// 聚合文本并解析第三方工具调用标记
+	if textContent != "" {
+		vendorCalls, cleanedText := parseVendorToolCalls(textContent)
+		if cleanedText != "" {
+			aggregatedContent.Parts = append(aggregatedContent.Parts, &genai.Part{Text: cleanedText})
+		}
+		for i, vc := range vendorCalls {
+			aggregatedContent.Parts = append(aggregatedContent.Parts, &genai.Part{
+				FunctionCall: &genai.FunctionCall{
+					ID:   fmt.Sprintf("vendor_call_%d", i),
+					Name: vc.Name,
+					Args: vc.Args,
+				},
+			})
+		}
+	}
+
+	if thoughtContent != "" {
+		aggregatedContent.Parts = append([]*genai.Part{{Text: thoughtContent, Thought: true}}, aggregatedContent.Parts...)
+	}
+
+	// 聚合标准工具调用
+	for _, builder := range toolCalls.OrderedBuilders() {
+		if builder == nil {
+			continue
+		}
+		part := &genai.Part{
+			FunctionCall: &genai.FunctionCall{
+				ID:   builder.id,
+				Name: builder.name,
+				Args: parseJSONArgs(builder.args),
+			},
+		}
+		aggregatedContent.Parts = append(aggregatedContent.Parts, part)
+	}
+
+	if streamErr != nil {
+		yield(nil, streamErr)
+		return
+	}
+
 	finalResp := &model.LLMResponse{
 		Content:       aggregatedContent,
 		UsageMetadata: usageMetadata,
@@ -227,19 +269,133 @@ type toolCallBuilder struct {
 	args string
 }
 
-// sortedKeys 返回排序后的 map keys
-func sortedKeys(m map[int]*toolCallBuilder) []int {
-	keys := make([]int, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+// chatStreamToolCallAggregator 聚合兼容 OpenAI 的流式工具调用。
+// 一些兼容接口不会稳定返回 index，这里优先按 index / id 归并，
+// 都缺失时再按当前位置兜底，并在检测到新 JSON 对象时自动切分。
+type chatStreamToolCallAggregator struct {
+	builders      map[string]*toolCallBuilder
+	order         []string
+	indexKeys     map[int]string
+	idKeys        map[string]string
+	fallbackKeys  map[int]string
+	nextSynthetic int
+}
+
+func newChatStreamToolCallAggregator() *chatStreamToolCallAggregator {
+	return &chatStreamToolCallAggregator{
+		builders:     make(map[string]*toolCallBuilder),
+		indexKeys:    make(map[int]string),
+		idKeys:       make(map[string]string),
+		fallbackKeys: make(map[int]string),
 	}
-	// 简单冒泡排序
-	for i := 0; i < len(keys)-1; i++ {
-		for j := 0; j < len(keys)-i-1; j++ {
-			if keys[j] > keys[j+1] {
-				keys[j], keys[j+1] = keys[j+1], keys[j]
-			}
+}
+
+func (a *chatStreamToolCallAggregator) AddDelta(pos int, toolCall openai.ToolCall) {
+	key := a.lookupKey(pos, toolCall)
+	if builder := a.builders[key]; shouldRotateToolCallBuilder(builder, toolCall) {
+		key = a.newSyntheticKey()
+	}
+
+	a.bindAliases(pos, toolCall, key)
+	builder := a.ensureBuilder(key)
+	if toolCall.ID != "" {
+		builder.id = toolCall.ID
+	}
+	if toolCall.Function.Name != "" {
+		builder.name = toolCall.Function.Name
+	}
+	if toolCall.Function.Arguments != "" {
+		builder.args += toolCall.Function.Arguments
+	}
+}
+
+func (a *chatStreamToolCallAggregator) OrderedBuilders() []*toolCallBuilder {
+	builders := make([]*toolCallBuilder, 0, len(a.order))
+	for _, key := range a.order {
+		builders = append(builders, a.builders[key])
+	}
+	return builders
+}
+
+func (a *chatStreamToolCallAggregator) lookupKey(pos int, toolCall openai.ToolCall) string {
+	if toolCall.Index != nil {
+		if key, ok := a.indexKeys[*toolCall.Index]; ok {
+			return key
 		}
 	}
-	return keys
+	if toolCall.ID != "" {
+		if key, ok := a.idKeys[toolCall.ID]; ok {
+			return key
+		}
+	}
+	if key, ok := a.fallbackKeys[pos]; ok {
+		return key
+	}
+	if toolCall.Index != nil {
+		return fmt.Sprintf("idx:%d", *toolCall.Index)
+	}
+	if toolCall.ID != "" {
+		return fmt.Sprintf("id:%s", toolCall.ID)
+	}
+	return a.newSyntheticKey()
+}
+
+func (a *chatStreamToolCallAggregator) bindAliases(pos int, toolCall openai.ToolCall, key string) {
+	if toolCall.Index != nil {
+		a.indexKeys[*toolCall.Index] = key
+	}
+	if toolCall.ID != "" {
+		a.idKeys[toolCall.ID] = key
+	}
+	if toolCall.Index == nil {
+		a.fallbackKeys[pos] = key
+	}
+}
+
+func (a *chatStreamToolCallAggregator) ensureBuilder(key string) *toolCallBuilder {
+	if builder, ok := a.builders[key]; ok {
+		return builder
+	}
+	builder := &toolCallBuilder{}
+	a.builders[key] = builder
+	a.order = append(a.order, key)
+	return builder
+}
+
+func (a *chatStreamToolCallAggregator) newSyntheticKey() string {
+	key := fmt.Sprintf("anon:%d", a.nextSynthetic)
+	a.nextSynthetic++
+	return key
+}
+
+func shouldRotateToolCallBuilder(builder *toolCallBuilder, toolCall openai.ToolCall) bool {
+	if builder == nil {
+		return false
+	}
+	if toolCall.ID != "" && builder.id != "" && toolCall.ID != builder.id {
+		return true
+	}
+	if toolCall.Function.Name != "" && builder.name != "" && toolCall.Function.Name != builder.name {
+		return true
+	}
+
+	if !isCompleteJSONObject(builder.args) {
+		return false
+	}
+
+	if toolCall.Function.Arguments != "" {
+		return true
+	}
+	if toolCall.ID != "" && builder.id == "" {
+		return true
+	}
+	return false
+}
+
+func isCompleteJSONObject(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return false
+	}
+	return json.Valid([]byte(trimmed))
 }

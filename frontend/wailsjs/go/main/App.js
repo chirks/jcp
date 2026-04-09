@@ -10,8 +10,20 @@ export function AddMCPServer(arg1) {
   return window['go']['main']['App']['AddMCPServer'](arg1);
 }
 
+export function AddStrategy(arg1) {
+  return window['go']['main']['App']['AddStrategy'](arg1);
+}
+
 export function AddToWatchlist(arg1) {
   return window['go']['main']['App']['AddToWatchlist'](arg1);
+}
+
+export function CancelInterruptedMeeting(arg1) {
+  return window['go']['main']['App']['CancelInterruptedMeeting'](arg1);
+}
+
+export function CancelMeeting(arg1) {
+  return window['go']['main']['App']['CancelMeeting'](arg1);
 }
 
 export function CheckForUpdate() {
@@ -30,8 +42,24 @@ export function DeleteMCPServer(arg1) {
   return window['go']['main']['App']['DeleteMCPServer'](arg1);
 }
 
+export function DeleteStrategy(arg1) {
+  return window['go']['main']['App']['DeleteStrategy'](arg1);
+}
+
 export function DoUpdate() {
   return window['go']['main']['App']['DoUpdate']();
+}
+
+export function EnhancePrompt(arg1) {
+  return window['go']['main']['App']['EnhancePrompt'](arg1);
+}
+
+export function GenerateStrategy(arg1) {
+  return window['go']['main']['App']['GenerateStrategy'](arg1);
+}
+
+export function GetActiveStrategyID() {
+  return window['go']['main']['App']['GetActiveStrategyID']();
 }
 
 export function GetAgentConfigs() {
@@ -46,12 +74,28 @@ export function GetAvailableTools() {
   return window['go']['main']['App']['GetAvailableTools']();
 }
 
+export function GetBoardFundFlow(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GetBoardFundFlow'](arg1, arg2, arg3);
+}
+
+export function GetBoardLeaders(arg1, arg2) {
+  return window['go']['main']['App']['GetBoardLeaders'](arg1, arg2);
+}
+
 export function GetConfig() {
   return window['go']['main']['App']['GetConfig']();
 }
 
 export function GetCurrentVersion() {
   return window['go']['main']['App']['GetCurrentVersion']();
+}
+
+export function GetF10Overview(arg1) {
+  return window['go']['main']['App']['GetF10Overview'](arg1);
+}
+
+export function GetF10Valuation(arg1) {
+  return window['go']['main']['App']['GetF10Valuation'](arg1);
 }
 
 export function GetHotTrend(arg1) {
@@ -66,6 +110,14 @@ export function GetKLineData(arg1, arg2, arg3) {
   return window['go']['main']['App']['GetKLineData'](arg1, arg2, arg3);
 }
 
+export function GetLongHuBangDetail(arg1, arg2) {
+  return window['go']['main']['App']['GetLongHuBangDetail'](arg1, arg2);
+}
+
+export function GetLongHuBangList(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GetLongHuBangList'](arg1, arg2, arg3);
+}
+
 export function GetMCPServerTools(arg1) {
   return window['go']['main']['App']['GetMCPServerTools'](arg1);
 }
@@ -76,6 +128,18 @@ export function GetMCPServers() {
 
 export function GetMCPStatus() {
   return window['go']['main']['App']['GetMCPStatus']();
+}
+
+export function GetMarketIndices() {
+  return window['go']['main']['App']['GetMarketIndices']();
+}
+
+export function GetMarketStatus() {
+  return window['go']['main']['App']['GetMarketStatus']();
+}
+
+export function GetOpenClawStatus() {
+  return window['go']['main']['App']['GetOpenClawStatus']();
 }
 
 export function GetOrCreateSession(arg1, arg2) {
@@ -90,12 +154,28 @@ export function GetSessionMessages(arg1) {
   return window['go']['main']['App']['GetSessionMessages'](arg1);
 }
 
+export function GetStockMoves(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GetStockMoves'](arg1, arg2, arg3);
+}
+
 export function GetStockRealTimeData(arg1) {
   return window['go']['main']['App']['GetStockRealTimeData'](arg1);
 }
 
+export function GetStrategies() {
+  return window['go']['main']['App']['GetStrategies']();
+}
+
 export function GetTelegraphList() {
   return window['go']['main']['App']['GetTelegraphList']();
+}
+
+export function GetTradeDates(arg1) {
+  return window['go']['main']['App']['GetTradeDates'](arg1);
+}
+
+export function GetTradingSchedule() {
+  return window['go']['main']['App']['GetTradingSchedule']();
 }
 
 export function GetWatchlist() {
@@ -104,6 +184,10 @@ export function GetWatchlist() {
 
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
+}
+
+export function NotifyFrontendReady() {
+  return window['go']['main']['App']['NotifyFrontendReady']();
 }
 
 export function OpenURL(arg1) {
@@ -118,12 +202,28 @@ export function RestartApp() {
   return window['go']['main']['App']['RestartApp']();
 }
 
+export function RetryAgent(arg1, arg2, arg3) {
+  return window['go']['main']['App']['RetryAgent'](arg1, arg2, arg3);
+}
+
+export function RetryAgentAndContinue(arg1) {
+  return window['go']['main']['App']['RetryAgentAndContinue'](arg1);
+}
+
 export function SearchStocks(arg1) {
   return window['go']['main']['App']['SearchStocks'](arg1);
 }
 
 export function SendMeetingMessage(arg1) {
   return window['go']['main']['App']['SendMeetingMessage'](arg1);
+}
+
+export function SetActiveStrategy(arg1) {
+  return window['go']['main']['App']['SetActiveStrategy'](arg1);
+}
+
+export function TestAIConnection(arg1) {
+  return window['go']['main']['App']['TestAIConnection'](arg1);
 }
 
 export function TestMCPConnection(arg1) {
@@ -144,6 +244,10 @@ export function UpdateMCPServer(arg1) {
 
 export function UpdateStockPosition(arg1, arg2, arg3) {
   return window['go']['main']['App']['UpdateStockPosition'](arg1, arg2, arg3);
+}
+
+export function UpdateStrategy(arg1) {
+  return window['go']['main']['App']['UpdateStrategy'](arg1);
 }
 
 export function WindowClose() {

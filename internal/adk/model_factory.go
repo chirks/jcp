@@ -1,14 +1,20 @@
 package adk
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/auth/httptransport"
+	"github.com/run-bigpig/jcp/internal/adk/anthropic"
 	"github.com/run-bigpig/jcp/internal/adk/openai"
 	"github.com/run-bigpig/jcp/internal/models"
 	"github.com/run-bigpig/jcp/internal/pkg/proxy"
@@ -21,6 +27,18 @@ import (
 )
 
 var log = logger.New("ModelFactory")
+
+const cherryStudioUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.2.4 Chrome/126.0.6478.234 Electron/31.7.6 Safari/537.36"
+
+// uaTransport 包装 RoundTripper，自动注入 User-Agent
+type uaTransport struct {
+	base http.RoundTripper
+}
+
+func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("User-Agent", cherryStudioUA)
+	return t.base.RoundTrip(req)
+}
 
 // ModelFactory 模型工厂，根据配置创建对应的 adk model
 type ModelFactory struct{}
@@ -42,6 +60,8 @@ func (f *ModelFactory) CreateModel(ctx context.Context, config *models.AIConfig)
 			return f.createOpenAIResponsesModel(config)
 		}
 		return f.createOpenAIModel(config)
+	case models.AIProviderAnthropic:
+		return f.createAnthropicModel(config)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", config.Provider)
 	}
@@ -54,7 +74,7 @@ func (f *ModelFactory) createGeminiModel(ctx context.Context, config *models.AIC
 		Backend: genai.BackendGeminiAPI,
 		// 注入代理 Transport
 		HTTPClient: &http.Client{
-			Transport: proxy.GetManager().GetTransport(),
+			Transport: &uaTransport{base: proxy.GetManager().GetTransport()},
 		},
 	}
 
@@ -64,42 +84,27 @@ func (f *ModelFactory) createGeminiModel(ctx context.Context, config *models.AIC
 // createVertexAIModel 创建 Vertex AI 模型
 func (f *ModelFactory) createVertexAIModel(ctx context.Context, config *models.AIConfig) (model.LLM, error) {
 	// 获取代理 Transport
-	proxyTransport := proxy.GetManager().GetTransport()
+	uaRT := &uaTransport{base: proxy.GetManager().GetTransport()}
 
 	// 获取凭证
 	var creds *auth.Credentials
 	var err error
 
+	detectOpts := &credentials.DetectOptions{
+		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Client: &http.Client{Transport: uaRT},
+	}
 	if config.CredentialsJSON != "" {
-		// 使用提供的证书 JSON
-		creds, err = credentials.DetectDefault(&credentials.DetectOptions{
-			Scopes:          []string{"https://www.googleapis.com/auth/cloud-platform"},
-			CredentialsJSON: []byte(config.CredentialsJSON),
-			Client: &http.Client{
-				Transport: proxyTransport,
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create credentials: %w", err)
-		}
-	} else {
-		// 使用默认凭证
-		creds, err = credentials.DetectDefault(&credentials.DetectOptions{
-			Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
-			Client: &http.Client{
-				Transport: proxyTransport,
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to detect default credentials: %w", err)
-		}
+		detectOpts.CredentialsJSON = []byte(config.CredentialsJSON)
+	}
+	creds, err = credentials.DetectDefault(detectOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect credentials: %w", err)
 	}
 
-	// 使用 httptransport.NewClient 创建带认证和代理的 HTTP Client
-	// BaseRoundTripper 用于注入代理 Transport，Credentials 用于自动添加认证 header
 	httpClient, err := httptransport.NewClient(&httptransport.Options{
 		Credentials:      creds,
-		BaseRoundTripper: proxyTransport,
+		BaseRoundTripper: uaRT,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create authenticated HTTP client: %w", err)
@@ -135,10 +140,29 @@ func (f *ModelFactory) createOpenAIModel(config *models.AIConfig) (model.LLM, er
 	openaiCfg.BaseURL = normalizeOpenAIBaseURL(config.BaseURL)
 	// 注入代理 Transport
 	openaiCfg.HTTPClient = &http.Client{
-		Transport: proxy.GetManager().GetTransport(),
+		Transport: &uaTransport{base: proxy.GetManager().GetTransport()},
 	}
 
-	return openai.NewOpenAIModel(config.ModelName, openaiCfg), nil
+	return openai.NewOpenAIModel(config.ModelName, openaiCfg, config.NoSystemRole, string(config.TokenParamMode)), nil
+}
+
+// normalizeAnthropicBaseURL 规范化 Anthropic BaseURL
+func normalizeAnthropicBaseURL(baseURL string) string {
+	if baseURL == "" {
+		return "https://api.anthropic.com"
+	}
+	baseURL = strings.TrimSpace(strings.TrimRight(baseURL, "/"))
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	return baseURL
+}
+
+// createAnthropicModel 创建 Anthropic 模型
+func (f *ModelFactory) createAnthropicModel(config *models.AIConfig) (model.LLM, error) {
+	baseURL := normalizeAnthropicBaseURL(config.BaseURL)
+	httpClient := &http.Client{
+		Transport: &uaTransport{base: proxy.GetManager().GetTransport()},
+	}
+	return anthropic.NewAnthropicModel(config.ModelName, config.APIKey, baseURL, httpClient, config.NoSystemRole), nil
 }
 
 // createOpenAIResponsesModel 创建使用 Responses API 的 OpenAI 模型
@@ -147,7 +171,390 @@ func (f *ModelFactory) createOpenAIResponsesModel(config *models.AIConfig) (mode
 
 	// 使用代理管理器的 HTTP Client
 	httpClient := &http.Client{
-		Transport: proxy.GetManager().GetTransport(),
+		Transport: &uaTransport{base: proxy.GetManager().GetTransport()},
 	}
-	return openai.NewResponsesModel(config.ModelName, config.APIKey, baseURL, httpClient), nil
+	return openai.NewResponsesModel(config.ModelName, config.APIKey, baseURL, httpClient, config.NoSystemRole), nil
+}
+
+// TestConnection 测试 AI 配置的连通性
+// 通过发送一个最小请求来验证 API Key、Base URL、模型名称是否正确
+func (f *ModelFactory) TestConnection(ctx context.Context, config *models.AIConfig) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	switch config.Provider {
+	case models.AIProviderOpenAI:
+		return f.testOpenAIConnection(ctx, config)
+	case models.AIProviderGemini:
+		return f.testGeminiConnection(ctx, config)
+	case models.AIProviderVertexAI:
+		return f.testVertexAIConnection(ctx, config)
+	case models.AIProviderAnthropic:
+		return f.testAnthropicConnection(ctx, config)
+	default:
+		return fmt.Errorf("不支持的 provider: %s", config.Provider)
+	}
+}
+
+// systemRoleProbeKeyword 探测暗号，不可能在正常对话中自然出现
+const systemRoleProbeKeyword = "SYS_PROBE_7X3K"
+
+// DetectSystemRoleSupport 检测接口是否支持 system role
+// 通过系统指令要求模型回复特定暗号，检查响应中是否包含该暗号
+// 返回 true 表示不支持（需要降级）
+func (f *ModelFactory) DetectSystemRoleSupport(ctx context.Context, config *models.AIConfig) bool {
+	switch config.Provider {
+	case models.AIProviderOpenAI:
+		return f.detectOpenAISystemRole(ctx, config)
+	case models.AIProviderAnthropic:
+		return f.detectAnthropicSystemRole(ctx, config)
+	default:
+		return false // Gemini/VertexAI 原生支持
+	}
+}
+
+// detectOpenAISystemRole 检测 OpenAI 兼容接口是否支持 system role
+func (f *ModelFactory) detectOpenAISystemRole(ctx context.Context, config *models.AIConfig) bool {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	baseURL := normalizeOpenAIBaseURL(config.BaseURL)
+	transport := proxy.GetManager().GetTransport()
+
+	systemPrompt := fmt.Sprintf(
+		"You must reply with exactly: %s. Do not add anything else.",
+		systemRoleProbeKeyword,
+	)
+
+	var body map[string]any
+	var endpoint string
+
+	if config.UseResponses {
+		endpoint = strings.TrimSuffix(baseURL, "/") + "/responses"
+		body = map[string]any{
+			"model":             config.ModelName,
+			"max_output_tokens": 30,
+			"input":             "Please follow the system instruction.",
+			"instructions":      systemPrompt,
+		}
+	} else {
+		endpoint = strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+		body = map[string]any{
+			"model": config.ModelName,
+			"messages": []map[string]string{
+				{"role": "system", "content": systemPrompt},
+				{"role": "user", "content": "Please follow the system instruction."},
+			},
+		}
+		setOpenAIChatTokenLimit(body, config.ModelName, config.TokenParamMode, 30)
+	}
+
+	respBody, statusCode, err := f.doOpenAIProbeRequest(ctx, endpoint, config, transport, body, 30)
+	if err != nil {
+		log.Warn("模型 [%s] system role 探测请求失败: %v", config.ModelName, err)
+		return false
+	}
+
+	if statusCode != http.StatusOK {
+		log.Warn("模型 [%s] 不支持 system role (HTTP %d): %s",
+			config.ModelName, statusCode, string(respBody))
+		return true
+	}
+
+	replyText := f.extractReplyText(respBody, config.UseResponses)
+	if strings.Contains(replyText, systemRoleProbeKeyword) {
+		log.Info("模型 [%s] 支持 system role（暗号匹配）", config.ModelName)
+		return false
+	}
+
+	log.Warn("模型 [%s] 不遵循 system role 指令（回复: %s）",
+		config.ModelName, replyText)
+	return true
+}
+
+// detectAnthropicSystemRole 检测 Anthropic 兼容接口是否支持 system 字段
+func (f *ModelFactory) detectAnthropicSystemRole(ctx context.Context, config *models.AIConfig) bool {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	baseURL := normalizeAnthropicBaseURL(config.BaseURL)
+	transport := proxy.GetManager().GetTransport()
+
+	body := map[string]any{
+		"model":      config.ModelName,
+		"max_tokens": 1,
+		"system":     fmt.Sprintf("Reply with exactly: %s", systemRoleProbeKeyword),
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+	}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return false
+	}
+
+	endpoint, err := url.JoinPath(baseURL, "v1", "messages")
+	if err != nil {
+		return false
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBody))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", config.APIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("User-Agent", cherryStudioUA)
+
+	client := &http.Client{Transport: transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Warn("模型 [%s] Anthropic system role 探测失败: %v", config.ModelName, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Warn("模型 [%s] 不支持 system 字段 (HTTP %d): %s",
+			config.ModelName, resp.StatusCode, string(respBody))
+		return true
+	}
+
+	// 从 Anthropic 响应中提取文本
+	replyText := f.extractAnthropicReplyText(respBody)
+	if strings.Contains(replyText, systemRoleProbeKeyword) {
+		log.Info("模型 [%s] 支持 system 字段（暗号匹配）", config.ModelName)
+		return false
+	}
+
+	log.Warn("模型 [%s] 不遵循 system 指令（回复: %s）", config.ModelName, replyText)
+	return true
+}
+
+// extractAnthropicReplyText 从 Anthropic Messages 响应中提取文本
+func (f *ModelFactory) extractAnthropicReplyText(respBody []byte) string {
+	var resp struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil || len(resp.Content) == 0 {
+		return ""
+	}
+	return resp.Content[0].Text
+}
+
+// testOpenAIConnection 测试 OpenAI 兼容接口连通性
+// 根据 UseResponses 配置决定使用 Responses API 或 Chat Completions API
+func (f *ModelFactory) testOpenAIConnection(ctx context.Context, config *models.AIConfig) error {
+	baseURL := normalizeOpenAIBaseURL(config.BaseURL)
+	transport := proxy.GetManager().GetTransport()
+
+	var body map[string]interface{}
+	var endpoint string
+
+	if config.UseResponses {
+		// 使用 Responses API 端点测试
+		endpoint = strings.TrimSuffix(baseURL, "/") + "/responses"
+		body = map[string]interface{}{
+			"model":             config.ModelName,
+			"max_output_tokens": 1,
+			"input":             "hi",
+		}
+	} else {
+		// 使用 Chat Completions API 端点测试
+		endpoint = strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+		body = map[string]interface{}{
+			"model":    config.ModelName,
+			"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		}
+		setOpenAIChatTokenLimit(body, config.ModelName, config.TokenParamMode, 1)
+	}
+
+	respBody, statusCode, err := f.doOpenAIProbeRequest(ctx, endpoint, config, transport, body, 1)
+	if err != nil {
+		return err
+	}
+
+	if statusCode == http.StatusOK {
+		return nil
+	}
+
+	return fmt.Errorf("HTTP %d: %s", statusCode, string(respBody))
+}
+
+// testGeminiConnection 测试 Gemini 连通性
+func (f *ModelFactory) testGeminiConnection(ctx context.Context, config *models.AIConfig) error {
+	llm, err := f.createGeminiModel(ctx, config)
+	if err != nil {
+		return fmt.Errorf("客户端创建失败: %w", err)
+	}
+
+	return f.testViaGenerate(ctx, llm)
+}
+
+// testVertexAIConnection 测试 Vertex AI 连通性
+func (f *ModelFactory) testVertexAIConnection(ctx context.Context, config *models.AIConfig) error {
+	llm, err := f.createVertexAIModel(ctx, config)
+	if err != nil {
+		return fmt.Errorf("客户端创建失败: %w", err)
+	}
+
+	return f.testViaGenerate(ctx, llm)
+}
+
+// testAnthropicConnection 测试 Anthropic 连通性
+func (f *ModelFactory) testAnthropicConnection(ctx context.Context, config *models.AIConfig) error {
+	baseURL := normalizeAnthropicBaseURL(config.BaseURL)
+	transport := proxy.GetManager().GetTransport()
+
+	body := map[string]any{
+		"model":      config.ModelName,
+		"max_tokens": 1,
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+	}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("请求构造失败: %w", err)
+	}
+
+	endpoint, err := url.JoinPath(baseURL, "v1", "messages")
+	if err != nil {
+		return fmt.Errorf("无效 BaseURL: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBody))
+	if err != nil {
+		return fmt.Errorf("请求创建失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", config.APIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.2.4 Chrome/126.0.6478.234 Electron/31.7.6 Safari/537.36")
+
+	client := &http.Client{Transport: transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("连接失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+}
+
+// testViaGenerate 通过 GenerateContent 发送最小请求测试连通性
+func (f *ModelFactory) testViaGenerate(ctx context.Context, llm model.LLM) error {
+	req := &model.LLMRequest{
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "hi"}}},
+		},
+		Config: &genai.GenerateContentConfig{
+			MaxOutputTokens: 1,
+		},
+	}
+
+	for _, err := range llm.GenerateContent(ctx, req, false) {
+		if err != nil {
+			return fmt.Errorf("调用失败: %w", err)
+		}
+		return nil
+	}
+	return nil
+}
+
+// doProbeRequest 发送探测请求，返回响应体、状态码
+func (f *ModelFactory) doProbeRequest(ctx context.Context, endpoint, apiKey string, transport http.RoundTripper, body map[string]any) ([]byte, int, error) {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("请求构造失败: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(string(jsonBody)))
+	if err != nil {
+		return nil, 0, fmt.Errorf("请求创建失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.2.4 Chrome/126.0.6478.234 Electron/31.7.6 Safari/537.36")
+
+	client := &http.Client{Transport: transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("连接失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	return respBody, resp.StatusCode, nil
+}
+
+func (f *ModelFactory) doOpenAIProbeRequest(
+	ctx context.Context,
+	endpoint string,
+	config *models.AIConfig,
+	transport http.RoundTripper,
+	body map[string]any,
+	limit int,
+) ([]byte, int, error) {
+	respBody, statusCode, err := f.doProbeRequest(ctx, endpoint, config.APIKey, transport, body)
+	if err != nil || config.UseResponses {
+		return respBody, statusCode, err
+	}
+	if !isOpenAIChatTokenParamRetryable(statusCode, respBody) {
+		return respBody, statusCode, err
+	}
+
+	resolvedMode := openai.ResolveTokenParamMode(config.ModelName, string(config.TokenParamMode))
+	retryBody := make(map[string]any, len(body))
+	for key, value := range body {
+		retryBody[key] = value
+	}
+	setOpenAIChatTokenLimitWithResolvedMode(retryBody, alternateOpenAIChatTokenParamMode(resolvedMode), limit)
+
+	log.Warn("模型 [%s] 探测请求 token 参数不兼容，切换参数名后重试", config.ModelName)
+	return f.doProbeRequest(ctx, endpoint, config.APIKey, transport, retryBody)
+}
+
+// extractReplyText 从 API 响应 JSON 中提取模型回复文本
+func (f *ModelFactory) extractReplyText(respBody []byte, useResponses bool) string {
+	if useResponses {
+		return f.extractResponsesReplyText(respBody)
+	}
+	return f.extractChatCompletionReplyText(respBody)
+}
+
+// extractChatCompletionReplyText 从 Chat Completions 响应中提取文本
+func (f *ModelFactory) extractChatCompletionReplyText(respBody []byte) string {
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return ""
+	}
+	if len(resp.Choices) == 0 {
+		return ""
+	}
+	return resp.Choices[0].Message.Content
+}
+
+// extractResponsesReplyText 从 Responses API 响应中提取文本
+func (f *ModelFactory) extractResponsesReplyText(respBody []byte) string {
+	var resp struct {
+		OutputText string `json:"output_text"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return ""
+	}
+	return resp.OutputText
 }

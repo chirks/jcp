@@ -1,5 +1,5 @@
 // 配置服务 - 调用后端API
-import { GetConfig, UpdateConfig, GetAvailableTools } from '@wailsjs/go/main/App';
+import { GetConfig, UpdateConfig, GetAvailableTools, TestAIConnection } from '@wailsjs/go/main/App';
 import type { models } from '@wailsjs/go/models';
 
 export type AppConfig = models.AppConfig;
@@ -21,4 +21,9 @@ export const updateConfig = async (config: AppConfig): Promise<string> => {
 // 获取可用的内置工具列表
 export const getAvailableTools = async (): Promise<ToolInfo[]> => {
   return await GetAvailableTools();
+};
+
+// 测试 AI 配置连通性
+export const testAIConnection = async (config: models.AIConfig): Promise<string> => {
+  return await TestAIConnection(config);
 };

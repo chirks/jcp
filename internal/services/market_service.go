@@ -4,8 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,7 +18,7 @@ import (
 
 	"github.com/run-bigpig/jcp/internal/logger"
 	"github.com/run-bigpig/jcp/internal/models"
-	"github.com/run-bigpig/jcp/internal/pkg/proxy"
+	"github.com/run-bigpig/jcp/internal/pkg/paths"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
@@ -21,10 +26,23 @@ import (
 
 var log = logger.New("market")
 
+// 预编译正则表达式，避免重复编译
+var (
+	sinaStockRegex = regexp.MustCompile(`var hq_str_(\w+)="([^"]*)"`)
+	sinaIndexRegex = regexp.MustCompile(`var hq_str_s_(\w+)="([^"]*)"`)
+)
+
 const (
-	sinaStockURL  = "http://hq.sinajs.cn/rn=%d&list=%s"
-	sinaKLineURL  = "http://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?symbol=%s&scale=%s&ma=5,10,20&datalen=%d"
-	holidayAPIURL = "https://holiday.dreace.top/"
+	sinaStockURL       = "http://hq.sinajs.cn/rn=%d&list=%s"
+	sinaKLineURL       = "http://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?symbol=%s&scale=%s&ma=5,10,20&datalen=%d"
+	emBoardFundFlowURL = "https://push2.eastmoney.com/api/qt/clist/get"
+	emFundFlowKLineURL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+	emAnnouncementURL  = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+)
+
+const (
+	klineCacheTTLIntraday = 2 * time.Second
+	klineCacheTTLDefault  = 30 * time.Second
 )
 
 // 默认大盘指数代码
@@ -46,6 +64,13 @@ type stockCache struct {
 	timestamp time.Time
 }
 
+// klineCache K线数据缓存
+type klineCache struct {
+	data      []models.KLineData
+	timestamp time.Time
+	ttl       time.Duration
+}
+
 // MarketStatus 市场交易状态
 type MarketStatus struct {
 	Status      string `json:"status"`      // trading, closed, pre_market, lunch_break
@@ -54,34 +79,90 @@ type MarketStatus struct {
 	HolidayName string `json:"holidayName"` // 节假日名称（如有）
 }
 
-// todayHolidayCache 当天节假日缓存
-type todayHolidayCache struct {
-	isHoliday bool
-	note      string
-	timestamp time.Time
+// TradingPeriod 交易时段
+type TradingPeriod struct {
+	Status    string `json:"status"`    // 状态标识
+	Text      string `json:"text"`      // 中文描述
+	StartTime string `json:"startTime"` // 开始时间 HH:MM
+	EndTime   string `json:"endTime"`   // 结束时间 HH:MM
+}
+
+// TradingSchedule 交易时间表
+type TradingSchedule struct {
+	IsTradeDay  bool            `json:"isTradeDay"`  // 今天是否交易日
+	HolidayName string          `json:"holidayName"` // 节假日名称
+	Periods     []TradingPeriod `json:"periods"`     // 时段列表
 }
 
 // MarketService 市场数据服务
 type MarketService struct {
-	client *http.Client
+	client           *http.Client
+	primaryProvider  marketProvider
+	fallbackProvider marketProvider
 
 	// 股票数据缓存
 	cache    map[string]*stockCache
 	cacheMu  sync.RWMutex
 	cacheTTL time.Duration
 
-	// 当天节假日缓存
-	todayCache   *todayHolidayCache
-	todayCacheMu sync.RWMutex
+	// K线数据缓存
+	klineCache    map[string]*klineCache
+	klineCacheMu  sync.RWMutex
+	klineCacheTTL time.Duration
 }
 
 // NewMarketService 创建市场数据服务
 func NewMarketService() *MarketService {
-	return &MarketService{
-		client:   proxy.GetManager().GetClientWithTimeout(10 * time.Second),
-		cache:    make(map[string]*stockCache),
-		cacheTTL: 2 * time.Second, // 缓存2秒，避免频繁请求
+	ms := newMarketService()
+	ms.primaryProvider = newTDXMarketProvider()
+	ms.fallbackProvider = newSinaMarketProvider(ms)
+	return ms
+}
+
+// cleanCacheLoop 定期清理过期缓存，防止内存泄漏
+func (ms *MarketService) cleanCacheLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		ms.cleanExpiredCache()
 	}
+}
+
+// cleanExpiredCache 清理过期缓存
+func (ms *MarketService) cleanExpiredCache() {
+	now := time.Now()
+
+	// 清理股票缓存
+	ms.cacheMu.Lock()
+	for key, cached := range ms.cache {
+		if now.Sub(cached.timestamp) > 10*time.Second {
+			delete(ms.cache, key)
+		}
+	}
+	ms.cacheMu.Unlock()
+
+	// 清理K线缓存
+	ms.klineCacheMu.Lock()
+	for key, cached := range ms.klineCache {
+		ttl := cached.ttl
+		if ttl <= 0 {
+			ttl = ms.klineCacheTTL
+		}
+		// 使用 3 倍 TTL 做内存回收，避免活跃缓存被过早清理
+		if now.Sub(cached.timestamp) > ttl*3 {
+			delete(ms.klineCache, key)
+		}
+	}
+	ms.klineCacheMu.Unlock()
+}
+
+// getKLineCacheTTL 返回不同周期的缓存策略
+func (ms *MarketService) getKLineCacheTTL(period string) time.Duration {
+	// 分时需要高时效，避免增量推送读取到过旧缓存
+	if period == "1m" {
+		return klineCacheTTLIntraday
+	}
+	return ms.klineCacheTTL
 }
 
 // GetStockDataWithOrderBook 获取股票实时数据（含真实盘口），带缓存
@@ -90,7 +171,11 @@ func (ms *MarketService) GetStockDataWithOrderBook(codes ...string) ([]StockWith
 		return nil, nil
 	}
 
-	cacheKey := strings.Join(codes, ",")
+	// 排序codes保证缓存key一致性
+	sortedCodes := make([]string, len(codes))
+	copy(sortedCodes, codes)
+	sort.Strings(sortedCodes)
+	cacheKey := strings.Join(sortedCodes, ",")
 
 	// 检查缓存
 	ms.cacheMu.RLock()
@@ -103,7 +188,7 @@ func (ms *MarketService) GetStockDataWithOrderBook(codes ...string) ([]StockWith
 	ms.cacheMu.RUnlock()
 
 	// 从API获取数据
-	data, err := ms.fetchStockDataWithOrderBook(codes...)
+	data, err := ms.fetchStockDataWithFallback(codes...)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +205,7 @@ func (ms *MarketService) GetStockDataWithOrderBook(codes ...string) ([]StockWith
 }
 
 // fetchStockDataWithOrderBook 从API获取股票数据（含盘口）
-func (ms *MarketService) fetchStockDataWithOrderBook(codes ...string) ([]StockWithOrderBook, error) {
+func (ms *MarketService) fetchStockDataWithOrderBookFromSina(codes ...string) ([]StockWithOrderBook, error) {
 	codeList := strings.Join(codes, ",")
 	url := fmt.Sprintf(sinaStockURL, time.Now().UnixNano(), codeList)
 
@@ -148,8 +233,7 @@ func (ms *MarketService) fetchStockDataWithOrderBook(codes ...string) ([]StockWi
 // parseSinaStockDataWithOrderBook 解析新浪股票数据（含盘口）
 func (ms *MarketService) parseSinaStockDataWithOrderBook(data string) ([]StockWithOrderBook, error) {
 	var stocks []StockWithOrderBook
-	re := regexp.MustCompile(`var hq_str_(\w+)="([^"]*)"`)
-	matches := re.FindAllStringSubmatch(data, -1)
+	matches := sinaStockRegex.FindAllStringSubmatch(data, -1)
 
 	for _, match := range matches {
 		if len(match) < 3 || match[2] == "" {
@@ -167,39 +251,22 @@ func (ms *MarketService) parseSinaStockDataWithOrderBook(data string) ([]StockWi
 
 // GetStockRealTimeData 获取股票实时数据
 func (ms *MarketService) GetStockRealTimeData(codes ...string) ([]models.Stock, error) {
-	if len(codes) == 0 {
-		return nil, nil
-	}
-
-	codeList := strings.Join(codes, ",")
-	url := fmt.Sprintf(sinaStockURL, time.Now().UnixNano(), codeList)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Referer", "http://finance.sina.com.cn")
-
-	resp, err := ms.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	reader := transform.NewReader(resp.Body, simplifiedchinese.GBK.NewDecoder())
-	body, err := io.ReadAll(reader)
+	data, err := ms.GetStockDataWithOrderBook(codes...)
 	if err != nil {
 		return nil, err
 	}
 
-	return ms.parseSinaStockData(string(body), codes)
+	stocks := make([]models.Stock, 0, len(data))
+	for _, item := range data {
+		stocks = append(stocks, item.Stock)
+	}
+	return stocks, nil
 }
 
 // parseSinaStockData 解析新浪股票数据
 func (ms *MarketService) parseSinaStockData(data string, codes []string) ([]models.Stock, error) {
 	var stocks []models.Stock
-	re := regexp.MustCompile(`var hq_str_(\w+)="([^"]*)"`)
-	matches := re.FindAllStringSubmatch(data, -1)
+	matches := sinaStockRegex.FindAllStringSubmatch(data, -1)
 
 	for _, match := range matches {
 		if len(match) < 3 || match[2] == "" {
@@ -294,8 +361,8 @@ func (ms *MarketService) parseStockWithOrderBook(code string, parts []string) St
 	}
 
 	// 计算累计量和占比
-	ms.calculateOrderBookTotals(bids)
-	ms.calculateOrderBookTotals(asks)
+	calculateOrderBookTotals(bids)
+	calculateOrderBookTotals(asks)
 
 	return StockWithOrderBook{
 		Stock:     stock,
@@ -304,7 +371,7 @@ func (ms *MarketService) parseStockWithOrderBook(code string, parts []string) St
 }
 
 // calculateOrderBookTotals 计算盘口累计量和占比
-func (ms *MarketService) calculateOrderBookTotals(items []models.OrderBookItem) {
+func calculateOrderBookTotals(items []models.OrderBookItem) {
 	if len(items) == 0 {
 		return
 	}
@@ -326,8 +393,45 @@ func (ms *MarketService) calculateOrderBookTotals(items []models.OrderBookItem) 
 	}
 }
 
-// GetKLineData 获取K线数据
+// GetKLineData 获取K线数据（带缓存）
 func (ms *MarketService) GetKLineData(code string, period string, days int) ([]models.KLineData, error) {
+	cacheKey := fmt.Sprintf("%s:%s:%d", code, period, days)
+	ttl := ms.getKLineCacheTTL(period)
+
+	// 检查缓存
+	ms.klineCacheMu.RLock()
+	if cached, ok := ms.klineCache[cacheKey]; ok {
+		cachedTTL := cached.ttl
+		if cachedTTL <= 0 {
+			cachedTTL = ttl
+		}
+		if time.Since(cached.timestamp) < cachedTTL {
+			ms.klineCacheMu.RUnlock()
+			return cached.data, nil
+		}
+	}
+	ms.klineCacheMu.RUnlock()
+
+	// 从API获取数据
+	klines, err := ms.fetchKLineDataWithFallback(code, period, days)
+	if err != nil {
+		return nil, err
+	}
+
+	// 更新缓存
+	ms.klineCacheMu.Lock()
+	ms.klineCache[cacheKey] = &klineCache{
+		data:      klines,
+		timestamp: time.Now(),
+		ttl:       ttl,
+	}
+	ms.klineCacheMu.Unlock()
+
+	return klines, nil
+}
+
+// fetchKLineData 从API获取K线数据
+func (ms *MarketService) fetchKLineDataFromSina(code string, period string, days int) ([]models.KLineData, error) {
 	scale := ms.periodToScale(period)
 	url := fmt.Sprintf(sinaKLineURL, code, scale, days)
 
@@ -349,8 +453,8 @@ func (ms *MarketService) GetKLineData(code string, period string, days int) ([]m
 
 	// 分时模式下只返回当天的数据，并计算均价线
 	if period == "1m" {
-		klines = ms.filterTodayKLines(klines)
-		klines = ms.calculateAvgLine(klines)
+		klines = filterTodayKLines(klines)
+		klines = calculateAvgLine(klines)
 	}
 
 	return klines, nil
@@ -373,7 +477,7 @@ func (ms *MarketService) periodToScale(period string) string {
 }
 
 // filterTodayKLines 过滤只返回当天的K线数据
-func (ms *MarketService) filterTodayKLines(klines []models.KLineData) []models.KLineData {
+func filterTodayKLines(klines []models.KLineData) []models.KLineData {
 	if len(klines) == 0 {
 		return klines
 	}
@@ -402,7 +506,7 @@ func (ms *MarketService) filterTodayKLines(klines []models.KLineData) []models.K
 }
 
 // calculateAvgLine 计算分时均价线 (VWAP = 累计成交额 / 累计成交量)
-func (ms *MarketService) calculateAvgLine(klines []models.KLineData) []models.KLineData {
+func calculateAvgLine(klines []models.KLineData) []models.KLineData {
 	if len(klines) == 0 {
 		return klines
 	}
@@ -504,17 +608,12 @@ func (ms *MarketService) GenerateOrderBook(price float64) models.OrderBook {
 
 // GetMarketStatus 获取当前市场交易状态
 func (ms *MarketService) GetMarketStatus() MarketStatus {
-	log.Debug("开始获取市场状态")
 	now := time.Now()
 	// 使用固定时区 UTC+8，避免 Windows 缺少时区数据库的问题
 	loc := time.FixedZone("CST", 8*60*60)
 	now = now.In(loc)
-	log.Debug("当前时间: %s, 星期: %s", now.Format("2006-01-02 15:04:05"), now.Weekday())
-
 	// 检查是否为交易日
 	isTradeDay, holidayName := ms.isTradeDay(now)
-	log.Debug("isTradeDay=%v, holidayName=%s", isTradeDay, holidayName)
-
 	if !isTradeDay {
 		statusText := "休市"
 		if holidayName != "" {
@@ -528,14 +627,12 @@ func (ms *MarketService) GetMarketStatus() MarketStatus {
 			IsTradeDay:  false,
 			HolidayName: holidayName,
 		}
-		log.Debug("返回结果: %+v", result)
 		return result
 	}
 
 	// 交易日，判断当前时间段
 	hour, minute := now.Hour(), now.Minute()
 	currentMinutes := hour*60 + minute
-	log.Debug("交易日时间判断: %02d:%02d, currentMinutes=%d", hour, minute, currentMinutes)
 
 	// A股交易时间: 9:30-11:30, 13:00-15:00
 	var result MarketStatus
@@ -553,81 +650,315 @@ func (ms *MarketService) GetMarketStatus() MarketStatus {
 	default:
 		result = MarketStatus{Status: "closed", StatusText: "已收盘", IsTradeDay: true}
 	}
-	log.Debug("返回结果: %+v", result)
 	return result
 }
 
-// isTradeDay 判断是否为交易日
-func (ms *MarketService) isTradeDay(_ time.Time) (bool, string) {
-	log.Debug("开始判断是否为交易日")
-	isHoliday, note := ms.getTodayHolidayStatus()
-	log.Debug("getTodayHolidayStatus返回: isHoliday=%v, note=%s", isHoliday, note)
-	if isHoliday {
+// GetTradingSchedule 获取交易时间表（供前端判断市场状态）
+func (ms *MarketService) GetTradingSchedule() TradingSchedule {
+	now := time.Now()
+	loc := time.FixedZone("CST", 8*60*60)
+	now = now.In(loc)
+
+	isTradeDay, holidayName := ms.isTradeDay(now)
+
+	// A股交易时段配置
+	periods := []TradingPeriod{
+		{Status: "pre_market", Text: "盘前", StartTime: "00:00", EndTime: "09:15"},
+		{Status: "pre_market", Text: "集合竞价", StartTime: "09:15", EndTime: "09:30"},
+		{Status: "trading", Text: "交易中", StartTime: "09:30", EndTime: "11:30"},
+		{Status: "lunch_break", Text: "午间休市", StartTime: "11:30", EndTime: "13:00"},
+		{Status: "trading", Text: "交易中", StartTime: "13:00", EndTime: "15:00"},
+		{Status: "closed", Text: "已收盘", StartTime: "15:00", EndTime: "24:00"},
+	}
+
+	return TradingSchedule{
+		IsTradeDay:  isTradeDay,
+		HolidayName: holidayName,
+		Periods:     periods,
+	}
+}
+
+// isTradeDay 判断指定日期是否为交易日
+// A股交易日判定：非周末 且 非节假日（调休上班也不算交易日）
+func (ms *MarketService) isTradeDay(date time.Time) (bool, string) {
+
+	// 周末一律不是交易日
+	weekday := date.Weekday()
+	if weekday == time.Saturday || weekday == time.Sunday {
+		return false, "周末"
+	}
+
+	// 工作日：检查是否为节假日
+	isOffDay, inList, note := ms.getHolidayStatus(date)
+	if inList && isOffDay {
 		return false, note
 	}
+
 	return true, ""
 }
 
-// getTodayHolidayStatus 获取当天节假日状态（带缓存）
-func (ms *MarketService) getTodayHolidayStatus() (bool, string) {
-	log.Debug("检查缓存")
-	ms.todayCacheMu.RLock()
-	if ms.todayCache != nil && time.Since(ms.todayCache.timestamp) < time.Hour {
-		defer ms.todayCacheMu.RUnlock()
-		log.Debug("命中缓存: isHoliday=%v, note=%s", ms.todayCache.isHoliday, ms.todayCache.note)
-		return ms.todayCache.isHoliday, ms.todayCache.note
+// getHolidayStatus 获取指定日期的节假日状态
+// 返回: isOffDay=true表示休息日, inList=是否在节假日列表中, note为节假日名称
+func (ms *MarketService) getHolidayStatus(date time.Time) (isOffDay bool, inList bool, note string) {
+	dateStr := date.Format("2006-01-02")
+	year := date.Year()
+
+	// 加载该年份的节假日数据
+	yearData, err := ms.loadHolidayData(year)
+	if err != nil {
+		log.Warn("加载 %d 年节假日数据失败: %v", year, err)
+		return false, false, ""
 	}
-	ms.todayCacheMu.RUnlock()
 
-	// 缓存过期或不存在，重新获取
-	log.Debug("缓存未命中，调用API")
-	isHoliday, note := ms.fetchTodayHolidayStatus()
-	log.Debug("API返回: isHoliday=%v, note=%s", isHoliday, note)
-
-	ms.todayCacheMu.Lock()
-	ms.todayCache = &todayHolidayCache{
-		isHoliday: isHoliday,
-		note:      note,
-		timestamp: time.Now(),
+	// 查找该日期
+	if isOff, exists := yearData[dateStr]; exists {
+		noteName := ms.getHolidayNote(year, dateStr)
+		return isOff, true, noteName
 	}
-	ms.todayCacheMu.Unlock()
 
-	return isHoliday, note
+	// 不在节假日列表中
+	return false, false, ""
 }
 
-// fetchTodayHolidayStatus 从 API 获取当天节假日状态
-func (ms *MarketService) fetchTodayHolidayStatus() (bool, string) {
-	resp, err := ms.client.Get(holidayAPIURL)
+// getHolidayNote 获取节假日名称
+func (ms *MarketService) getHolidayNote(year int, dateStr string) string {
+	cacheFile := getHolidayCacheFile(year)
+	fileData, err := os.ReadFile(cacheFile)
 	if err != nil {
-		fmt.Println("[fetchTodayHolidayStatus] request error:", err)
-		return false, ""
+		return ""
+	}
+
+	var hd holidayData
+	if json.Unmarshal(fileData, &hd) != nil {
+		return ""
+	}
+
+	for _, day := range hd.Days {
+		if day.Date == dateStr {
+			return day.Name
+		}
+	}
+	return ""
+}
+
+// tradeDatesCache 交易日缓存文件结构
+type tradeDatesCache struct {
+	TradeDates []string  `json:"tradeDates"` // 交易日列表
+	UpdatedAt  time.Time `json:"updatedAt"`  // 更新时间
+}
+
+// holidayData 节假日数据结构
+type holidayData struct {
+	Year int          `json:"year"`
+	Days []holidayDay `json:"days"`
+}
+
+type holidayDay struct {
+	Name     string `json:"name"`
+	Date     string `json:"date"`
+	IsOffDay bool   `json:"isOffDay"`
+}
+
+// holidayCache 节假日缓存（按年份）
+var (
+	holidayCacheMu   sync.RWMutex
+	holidayCacheData = make(map[int]map[string]bool) // year -> date -> isOffDay
+)
+
+const holidayCDNURL = "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/%d.json"
+
+// getHolidayCacheFile 获取节假日缓存文件路径
+func getHolidayCacheFile(year int) string {
+	return filepath.Join(paths.EnsureCacheDir("holiday"), fmt.Sprintf("%d.json", year))
+}
+
+// loadHolidayData 加载指定年份的节假日数据
+func (ms *MarketService) loadHolidayData(year int) (map[string]bool, error) {
+	// 先检查内存缓存
+	holidayCacheMu.RLock()
+	if data, ok := holidayCacheData[year]; ok {
+		holidayCacheMu.RUnlock()
+		return data, nil
+	}
+	holidayCacheMu.RUnlock()
+
+	// 尝试从文件缓存加载
+	cacheFile := getHolidayCacheFile(year)
+	if fileData, err := os.ReadFile(cacheFile); err == nil {
+		var hd holidayData
+		if json.Unmarshal(fileData, &hd) == nil {
+			data := ms.parseHolidayData(&hd)
+			holidayCacheMu.Lock()
+			holidayCacheData[year] = data
+			holidayCacheMu.Unlock()
+			return data, nil
+		}
+	}
+
+	// 从CDN获取
+	return ms.fetchHolidayData(year)
+}
+
+// fetchHolidayData 从CDN获取节假日数据
+func (ms *MarketService) fetchHolidayData(year int) (map[string]bool, error) {
+	url := fmt.Sprintf(holidayCDNURL, year)
+	resp, err := ms.client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("获取节假日数据失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("[fetchTodayHolidayStatus] read body error:", err)
-		return false, ""
+		return nil, err
 	}
 
-	// 解析 API 响应: {"date":"2026-02-04","isHoliday":false,"note":"普通工作日","type":"工作日"}
-	var apiResp struct {
-		Date      string `json:"date"`
-		IsHoliday bool   `json:"isHoliday"`
-		Note      string `json:"note"`
-		Type      string `json:"type"`
+	var hd holidayData
+	if err := json.Unmarshal(body, &hd); err != nil {
+		return nil, err
 	}
 
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		fmt.Println("[fetchTodayHolidayStatus] parse error:", err)
-		return false, ""
+	// 保存到文件缓存
+	cacheFile := getHolidayCacheFile(year)
+	os.WriteFile(cacheFile, body, 0644)
+
+	// 解析并缓存到内存
+	data := ms.parseHolidayData(&hd)
+	holidayCacheMu.Lock()
+	holidayCacheData[year] = data
+	holidayCacheMu.Unlock()
+
+	log.Info("加载 %d 年节假日数据，共 %d 条", year, len(hd.Days))
+	return data, nil
+}
+
+// parseHolidayData 解析节假日数据为 map
+func (ms *MarketService) parseHolidayData(hd *holidayData) map[string]bool {
+	data := make(map[string]bool)
+	for _, day := range hd.Days {
+		data[day.Date] = day.IsOffDay
+	}
+	return data
+}
+
+// isTradeDate 判断指定日期是否为交易日
+// A股交易日 = 非周末 且 非节假日（调休上班也不算交易日）
+func (ms *MarketService) isTradeDate(date time.Time) bool {
+	isTradeDay, _ := ms.isTradeDay(date)
+	return isTradeDay
+}
+
+// getTradeDatesCacheFile 获取交易日缓存文件路径
+func getTradeDatesCacheFile() string {
+	return filepath.Join(paths.EnsureCacheDir(""), "trade_dates.json")
+}
+
+// GetTradeDates 获取指定天数内的交易日列表（从今天往前推）
+func (ms *MarketService) GetTradeDates(days int) ([]string, error) {
+	// 先尝试从文件缓存加载
+	cached, err := ms.loadTradeDatesCache()
+	if err == nil && len(cached.TradeDates) > 0 {
+		// 检查缓存是否过期（每天更新一次）
+		if time.Since(cached.UpdatedAt) < 24*time.Hour {
+			log.Debug("使用交易日缓存，共 %d 天", len(cached.TradeDates))
+			return ms.filterTradeDates(cached.TradeDates, days), nil
+		}
 	}
 
-	return apiResp.IsHoliday, apiResp.Note
+	// 缓存不存在或过期，重新获取
+	log.Info("开始获取交易日列表")
+	tradeDates, err := ms.fetchTradeDates(90) // 获取90天的数据
+	if err != nil {
+		// 如果获取失败但有旧缓存，使用旧缓存
+		if cached != nil && len(cached.TradeDates) > 0 {
+			log.Warn("获取交易日失败，使用旧缓存: %v", err)
+			return ms.filterTradeDates(cached.TradeDates, days), nil
+		}
+		return nil, err
+	}
+
+	// 保存到文件缓存
+	if err := ms.saveTradeDatesCache(tradeDates); err != nil {
+		log.Warn("保存交易日缓存失败: %v", err)
+	}
+
+	return ms.filterTradeDates(tradeDates, days), nil
+}
+
+// filterTradeDates 过滤交易日列表，只返回指定天数
+func (ms *MarketService) filterTradeDates(dates []string, days int) []string {
+	if len(dates) <= days {
+		return dates
+	}
+	return dates[:days]
+}
+
+// loadTradeDatesCache 从文件加载交易日缓存
+func (ms *MarketService) loadTradeDatesCache() (*tradeDatesCache, error) {
+	data, err := os.ReadFile(getTradeDatesCacheFile())
+	if err != nil {
+		return nil, err
+	}
+	var cache tradeDatesCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil, err
+	}
+	return &cache, nil
+}
+
+// saveTradeDatesCache 保存交易日缓存到文件
+func (ms *MarketService) saveTradeDatesCache(dates []string) error {
+	cache := tradeDatesCache{
+		TradeDates: dates,
+		UpdatedAt:  time.Now(),
+	}
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(getTradeDatesCacheFile(), data, 0644)
+}
+
+// fetchTradeDates 获取交易日列表
+func (ms *MarketService) fetchTradeDates(days int) ([]string, error) {
+	var tradeDates []string
+	today := time.Now()
+
+	// 预加载需要的年份节假日数据
+	yearsNeeded := make(map[int]bool)
+	for i := 0; i < days; i++ {
+		yearsNeeded[today.AddDate(0, 0, -i).Year()] = true
+	}
+	for year := range yearsNeeded {
+		if _, err := ms.loadHolidayData(year); err != nil {
+			log.Warn("加载 %d 年节假日数据失败: %v", year, err)
+		}
+	}
+
+	for i := 0; i < days; i++ {
+		date := today.AddDate(0, 0, -i)
+		dateStr := date.Format("2006-01-02")
+
+		if ms.isTradeDate(date) {
+			tradeDates = append(tradeDates, dateStr)
+		}
+	}
+
+	log.Info("获取到 %d 个交易日", len(tradeDates))
+	return tradeDates, nil
 }
 
 // GetMarketIndices 获取大盘指数数据
 func (ms *MarketService) GetMarketIndices() ([]models.MarketIndex, error) {
+	return ms.fetchMarketIndicesWithFallback()
+}
+
+// SearchStocks 搜索股票
+func (ms *MarketService) SearchStocks(keyword string, limit int) []StockSearchResult {
+	return ms.searchStocksWithFallback(keyword, limit)
+}
+
+func (ms *MarketService) fetchMarketIndicesFromSina() ([]models.MarketIndex, error) {
 	codeList := strings.Join(defaultIndexCodes, ",")
 	url := fmt.Sprintf(sinaStockURL, time.Now().UnixNano(), codeList)
 
@@ -657,8 +988,7 @@ func (ms *MarketService) GetMarketIndices() ([]models.MarketIndex, error) {
 // 字段: 名称,当前点位,涨跌点数,涨跌幅(%),成交量(手),成交额(万元)
 func (ms *MarketService) parseMarketIndices(data string) ([]models.MarketIndex, error) {
 	var indices []models.MarketIndex
-	re := regexp.MustCompile(`var hq_str_s_(\w+)="([^"]*)"`)
-	matches := re.FindAllStringSubmatch(data, -1)
+	matches := sinaIndexRegex.FindAllStringSubmatch(data, -1)
 
 	for _, match := range matches {
 		if len(match) < 3 || match[2] == "" {
@@ -686,4 +1016,744 @@ func (ms *MarketService) parseMarketIndices(data string) ([]models.MarketIndex, 
 		})
 	}
 	return indices, nil
+}
+
+// GetBoardFundFlowList 获取板块资金流列表（行业/概念/地域）
+func (ms *MarketService) GetBoardFundFlowList(category string, page int, size int) (models.BoardFundFlowList, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 {
+		size = 20
+	}
+	if size > 200 {
+		size = 200
+	}
+
+	normalizedCategory := normalizeBoardCategory(category)
+
+	params := url.Values{}
+	params.Set("np", "1")
+	params.Set("fltt", "2")
+	params.Set("invt", "2")
+	params.Set("po", "1")
+	params.Set("fid", "f62")
+	params.Set("stat", "1")
+	params.Set("fields", "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124")
+	params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
+	params.Set("pn", strconv.Itoa(page))
+	params.Set("pz", strconv.Itoa(size))
+	params.Set("fs", boardFundFlowFS(normalizedCategory))
+
+	raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
+		"Referer":    "https://data.eastmoney.com/",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	})
+	if err != nil {
+		return models.BoardFundFlowList{}, err
+	}
+
+	data, ok := raw["data"].(map[string]any)
+	if !ok || data == nil {
+		return models.BoardFundFlowList{}, fmt.Errorf("板块资金流响应缺少data")
+	}
+
+	diffRows := toMapSliceLocal(toSliceAnyLocal(data["diff"]))
+	items := make([]models.BoardFundFlowItem, 0, len(diffRows))
+	var updateTime string
+	for _, row := range diffRows {
+		item := models.BoardFundFlowItem{
+			Code:                 strings.TrimSpace(toStringLocal(row["f12"])),
+			Name:                 strings.TrimSpace(toStringLocal(row["f14"])),
+			Price:                toFloat64Any(row["f2"]),
+			ChangePercent:        toFloat64Any(row["f3"]),
+			MainNetInflow:        toFloat64Any(row["f62"]),
+			MainNetInflowRatio:   toFloat64Any(row["f184"]),
+			SuperNetInflow:       toFloat64Any(row["f66"]),
+			SuperNetInflowRatio:  toFloat64Any(row["f69"]),
+			LargeNetInflow:       toFloat64Any(row["f72"]),
+			LargeNetInflowRatio:  toFloat64Any(row["f75"]),
+			MediumNetInflow:      toFloat64Any(row["f78"]),
+			MediumNetInflowRatio: toFloat64Any(row["f81"]),
+			SmallNetInflow:       toFloat64Any(row["f84"]),
+			SmallNetInflowRatio:  toFloat64Any(row["f87"]),
+		}
+		if ts := toInt64Any(row["f124"]); ts > 0 {
+			item.UpdateTime = formatEastmoneyTimestamp(ts)
+			if updateTime == "" {
+				updateTime = item.UpdateTime
+			}
+		}
+		items = append(items, item)
+	}
+
+	return models.BoardFundFlowList{
+		Category:   normalizedCategory,
+		Items:      items,
+		Total:      toInt64Any(data["total"]),
+		UpdateTime: updateTime,
+	}, nil
+}
+
+// GetStockMovesList 获取盘口异动列表
+func (ms *MarketService) GetStockMovesList(moveType string, page int, size int) (models.StockMoveList, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 {
+		size = 30
+	}
+	if size > 200 {
+		size = 200
+	}
+
+	normalizedMoveType := normalizeStockMoveType(moveType)
+	fid, po := stockMoveSort(normalizedMoveType)
+
+	params := url.Values{}
+	params.Set("np", "1")
+	params.Set("fltt", "2")
+	params.Set("invt", "2")
+	params.Set("fid", fid)
+	params.Set("po", po)
+	params.Set("pn", strconv.Itoa(page))
+	params.Set("pz", strconv.Itoa(size))
+	params.Set("fs", "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23")
+	params.Set("fields", "f12,f14,f2,f3,f22,f8,f5,f6,f62,f184,f15,f16,f17,f18,f124")
+	params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
+
+	raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
+		"Referer":         "https://quote.eastmoney.com/",
+		"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"Accept":          "*/*",
+		"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+		"Connection":      "keep-alive",
+	})
+	if err != nil {
+		return models.StockMoveList{}, err
+	}
+
+	data, ok := raw["data"].(map[string]any)
+	if !ok || data == nil {
+		return models.StockMoveList{}, fmt.Errorf("盘口异动响应缺少data")
+	}
+
+	diffRows := toMapSliceLocal(toSliceAnyLocal(data["diff"]))
+	items := make([]models.StockMoveItem, 0, len(diffRows))
+	var updateTime string
+	for idx, row := range diffRows {
+		item := models.StockMoveItem{
+			Rank:               (page-1)*size + idx + 1,
+			Code:               strings.TrimSpace(toStringLocal(row["f12"])),
+			Name:               strings.TrimSpace(toStringLocal(row["f14"])),
+			Price:              toFloat64Any(row["f2"]),
+			ChangePercent:      toFloat64Any(row["f3"]),
+			Speed:              toFloat64Any(row["f22"]),
+			TurnoverRate:       toFloat64Any(row["f8"]),
+			Volume:             toInt64Any(row["f5"]),
+			Amount:             toFloat64Any(row["f6"]),
+			MainNetInflow:      toFloat64Any(row["f62"]),
+			MainNetInflowRatio: toFloat64Any(row["f184"]),
+			High:               toFloat64Any(row["f15"]),
+			Low:                toFloat64Any(row["f16"]),
+			Open:               toFloat64Any(row["f17"]),
+			PreClose:           toFloat64Any(row["f18"]),
+		}
+		if ts := toInt64Any(row["f124"]); ts > 0 {
+			item.UpdateTime = formatEastmoneyTimestamp(ts)
+			if updateTime == "" {
+				updateTime = item.UpdateTime
+			}
+		}
+		items = append(items, item)
+	}
+
+	return models.StockMoveList{
+		MoveType:   normalizedMoveType,
+		Items:      items,
+		Total:      toInt64Any(data["total"]),
+		UpdateTime: updateTime,
+	}, nil
+}
+
+// GetBoardLeaders 获取板块龙头候选
+func (ms *MarketService) GetBoardLeaders(boardCode string, limit int) (models.BoardLeaderList, error) {
+	normalizedBoard := normalizeBoardCode(boardCode)
+	if normalizedBoard == "" {
+		return models.BoardLeaderList{}, fmt.Errorf("无效板块代码: %s", boardCode)
+	}
+	if limit <= 0 {
+		limit = 6
+	}
+	if limit > 30 {
+		limit = 30
+	}
+
+	fetchSize := limit * 6
+	if fetchSize < 30 {
+		fetchSize = 30
+	}
+	if fetchSize > 200 {
+		fetchSize = 200
+	}
+
+	params := url.Values{}
+	params.Set("np", "1")
+	params.Set("fltt", "2")
+	params.Set("invt", "2")
+	params.Set("po", "1")
+	params.Set("fid", "f3")
+	params.Set("fields", "f12,f14,f2,f3,f8,f62,f184,f124")
+	params.Set("ut", "8dec03ba335b81bf4ebdf7b29ec27d15")
+	params.Set("pn", "1")
+	params.Set("pz", strconv.Itoa(fetchSize))
+	params.Set("fs", "b:"+normalizedBoard)
+
+	raw, err := ms.fetchMarketJSON(emBoardFundFlowURL+"?"+params.Encode(), map[string]string{
+		"Referer":    "https://data.eastmoney.com/",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	})
+	if err != nil {
+		return models.BoardLeaderList{}, err
+	}
+
+	data, ok := raw["data"].(map[string]any)
+	if !ok || data == nil {
+		return models.BoardLeaderList{}, fmt.Errorf("板块龙头响应缺少data")
+	}
+
+	diffRows := toMapSliceLocal(toSliceAnyLocal(data["diff"]))
+	items := make([]models.BoardLeaderItem, 0, len(diffRows))
+	var updateTime string
+	for _, row := range diffRows {
+		item := models.BoardLeaderItem{
+			Code:               strings.TrimSpace(toStringLocal(row["f12"])),
+			Name:               strings.TrimSpace(toStringLocal(row["f14"])),
+			Price:              toFloat64Any(row["f2"]),
+			ChangePercent:      toFloat64Any(row["f3"]),
+			TurnoverRate:       toFloat64Any(row["f8"]),
+			MainNetInflow:      toFloat64Any(row["f62"]),
+			MainNetInflowRatio: toFloat64Any(row["f184"]),
+		}
+		item.Score = calculateBoardLeaderScore(item.ChangePercent, item.MainNetInflow, item.MainNetInflowRatio)
+		if ts := toInt64Any(row["f124"]); ts > 0 {
+			item.UpdateTime = formatEastmoneyTimestamp(ts)
+			if updateTime == "" {
+				updateTime = item.UpdateTime
+			}
+		}
+		items = append(items, item)
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Score == items[j].Score {
+			if items[i].ChangePercent == items[j].ChangePercent {
+				return items[i].MainNetInflow > items[j].MainNetInflow
+			}
+			return items[i].ChangePercent > items[j].ChangePercent
+		}
+		return items[i].Score > items[j].Score
+	})
+
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	for i := range items {
+		items[i].Rank = i + 1
+	}
+
+	return models.BoardLeaderList{
+		BoardCode:  normalizedBoard,
+		Items:      items,
+		UpdateTime: updateTime,
+	}, nil
+}
+
+// GetIndexFundFlowSeries 获取指数资金流曲线
+func (ms *MarketService) GetIndexFundFlowSeries(code string, interval string, limit int) (models.FundFlowKLineSeries, error) {
+	if strings.TrimSpace(code) == "" {
+		return models.FundFlowKLineSeries{}, fmt.Errorf("未提供指数代码")
+	}
+	if limit < 0 {
+		limit = 0
+	}
+
+	params := url.Values{}
+	params.Set("lmt", "0")
+	params.Set("klt", normalizeFundFlowInterval(interval))
+	params.Set("fields1", "f1,f2,f3,f7")
+	params.Set("fields2", "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65")
+	params.Set("ut", "b2884a393a59ad64002292a3e90d46a5")
+	params.Set("secid", indexSecID(code))
+
+	raw, err := ms.fetchMarketJSON(emFundFlowKLineURL+"?"+params.Encode(), map[string]string{
+		"Referer":    "https://quote.eastmoney.com/",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	})
+	if err != nil {
+		return models.FundFlowKLineSeries{}, err
+	}
+
+	data, ok := raw["data"].(map[string]any)
+	if !ok || data == nil {
+		return models.FundFlowKLineSeries{}, fmt.Errorf("资金流曲线响应缺少data")
+	}
+
+	series := models.FundFlowKLineSeries{
+		Code:   toStringLocal(data["code"]),
+		Name:   toStringLocal(data["name"]),
+		Market: int(toInt64Any(data["market"])),
+	}
+	series.TradePeriods = parseTradePeriods(data["tradePeriods"])
+
+	points := make([]models.FundFlowKLine, 0)
+	for _, line := range toStringSlice(data["klines"]) {
+		parts := strings.Split(line, ",")
+		if len(parts) < 6 {
+			continue
+		}
+		points = append(points, models.FundFlowKLine{
+			Time:            strings.TrimSpace(parts[0]),
+			MainNetInflow:   parseFloat64Safe(parts[1]),
+			SuperNetInflow:  parseFloat64Safe(parts[2]),
+			LargeNetInflow:  parseFloat64Safe(parts[3]),
+			MediumNetInflow: parseFloat64Safe(parts[4]),
+			SmallNetInflow:  parseFloat64Safe(parts[5]),
+		})
+	}
+	if limit > 0 && len(points) > limit {
+		points = points[len(points)-limit:]
+	}
+	series.KLines = points
+	return series, nil
+}
+
+// GetStockAnnouncements 获取个股公告摘要
+func (ms *MarketService) GetStockAnnouncements(code string, page int, size int) (models.StockAnnouncements, error) {
+	normalized := normalizeStockListCode(code)
+	if normalized == "" {
+		return models.StockAnnouncements{}, fmt.Errorf("未提供股票代码")
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 {
+		size = 10
+	}
+
+	params := url.Values{}
+	params.Set("ann_type", "A")
+	params.Set("client_source", "web")
+	params.Set("stock_list", normalized)
+	params.Set("page_index", strconv.Itoa(page))
+	params.Set("page_size", strconv.Itoa(size))
+
+	raw, err := ms.fetchMarketJSON(emAnnouncementURL+"?"+params.Encode(), map[string]string{
+		"Referer":    "https://notice.eastmoney.com/",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	})
+	if err != nil {
+		return models.StockAnnouncements{}, err
+	}
+
+	data, ok := raw["data"].(map[string]any)
+	if !ok || data == nil {
+		return models.StockAnnouncements{}, fmt.Errorf("公告响应缺少data")
+	}
+
+	rows := toMapSliceLocal(toSliceAnyLocal(data["list"]))
+	items := make([]models.StockAnnouncement, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, models.StockAnnouncement{
+			Title:      strings.TrimSpace(toStringLocal(row["title"])),
+			NoticeDate: strings.TrimSpace(toStringLocal(row["notice_date"])),
+			Type:       strings.TrimSpace(toStringLocal(row["ann_type"])),
+			Columns:    strings.TrimSpace(toStringLocal(row["columns"])),
+			ArtCode:    strings.TrimSpace(toStringLocal(row["art_code"])),
+		})
+	}
+
+	return models.StockAnnouncements{
+		Code:  normalized,
+		Items: items,
+		Total: toInt64Any(data["total"]),
+	}, nil
+}
+
+func normalizeBoardCategory(category string) string {
+	switch strings.ToLower(strings.TrimSpace(category)) {
+	case "industry", "hy", "行业":
+		return "industry"
+	case "concept", "gn", "概念", "题材":
+		return "concept"
+	case "region", "dy", "地区", "地域":
+		return "region"
+	default:
+		return "industry"
+	}
+}
+
+func normalizeStockMoveType(moveType string) string {
+	switch strings.ToLower(strings.TrimSpace(moveType)) {
+	case "surge", "speed_up", "speedup", "rapid_up", "up":
+		return "surge"
+	case "drop", "speed_down", "speeddown", "rapid_down", "down":
+		return "drop"
+	case "change_up", "rise", "up_change":
+		return "change_up"
+	case "change_down", "fall", "down_change":
+		return "change_down"
+	case "mainflow", "fund", "capital":
+		return "mainflow"
+	case "turnover", "activity", "active":
+		return "turnover"
+	default:
+		return "surge"
+	}
+}
+
+func stockMoveSort(moveType string) (string, string) {
+	switch moveType {
+	case "drop":
+		return "f22", "0"
+	case "change_up":
+		return "f3", "1"
+	case "change_down":
+		return "f3", "0"
+	case "mainflow":
+		return "f62", "1"
+	case "turnover":
+		return "f8", "1"
+	default:
+		return "f22", "1"
+	}
+}
+
+func normalizeBoardCode(boardCode string) string {
+	candidate := strings.ToUpper(strings.TrimSpace(boardCode))
+	candidate = strings.TrimPrefix(candidate, "B:")
+	if strings.HasPrefix(candidate, "BI") && len(candidate) == 6 {
+		candidate = "BK" + candidate[2:]
+	}
+	if strings.HasPrefix(candidate, "BK") && len(candidate) == 6 {
+		return candidate
+	}
+	if len(candidate) == 4 && isDigits(candidate) {
+		return "BK" + candidate
+	}
+	return ""
+}
+
+func isDigits(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, ch := range text {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func calculateBoardLeaderScore(changePercent, mainNetInflow, mainNetInflowRatio float64) float64 {
+	flowScore := 0.0
+	if mainNetInflow != 0 {
+		flowScore = math.Log10(math.Abs(mainNetInflow)/1e6 + 1)
+		if mainNetInflow < 0 {
+			flowScore = -flowScore
+		}
+	}
+	score := changePercent*1.8 + mainNetInflowRatio*0.8 + flowScore*3.0
+	return math.Round(score*100) / 100
+}
+
+func boardFundFlowFS(category string) string {
+	switch category {
+	case "concept":
+		return "m:90 t:3"
+	case "region":
+		return "m:90 t:1"
+	default:
+		return "m:90 s:4"
+	}
+}
+
+func normalizeFundFlowInterval(interval string) string {
+	switch strings.ToLower(strings.TrimSpace(interval)) {
+	case "1", "1m", "1min", "min":
+		return "1"
+	case "5", "5m":
+		return "5"
+	case "15", "15m":
+		return "15"
+	case "30", "30m":
+		return "30"
+	case "60", "60m":
+		return "60"
+	case "101", "1d", "day":
+		return "101"
+	default:
+		return "1"
+	}
+}
+
+func normalizeStockListCode(code string) string {
+	lower := normalizeMarketCode(code)
+	if strings.HasPrefix(lower, "sh") || strings.HasPrefix(lower, "sz") || strings.HasPrefix(lower, "bj") {
+		return lower[2:]
+	}
+	return lower
+}
+
+func normalizeMarketCode(code string) string {
+	lower := strings.ToLower(strings.TrimSpace(code))
+	if lower == "" {
+		return ""
+	}
+	if strings.HasPrefix(lower, "sh") || strings.HasPrefix(lower, "sz") || strings.HasPrefix(lower, "bj") {
+		return lower
+	}
+	if len(lower) == 6 && isDigits(lower) {
+		switch lower[0] {
+		case '6':
+			return "sh" + lower
+		case '0', '3':
+			return "sz" + lower
+		case '4', '8':
+			return "bj" + lower
+		}
+	}
+	return lower
+}
+
+func indexSecID(code string) string {
+	normalized := normalizeMarketCode(code)
+	switch normalized {
+	case "sh000001":
+		return "1.000001"
+	case "sz399001":
+		return "0.399001"
+	case "sz399006":
+		return "0.399006"
+	default:
+		if strings.HasPrefix(normalized, "sh") {
+			return "1." + normalized[2:]
+		}
+		return "0." + strings.TrimPrefix(normalized, normalized[:2])
+	}
+}
+
+func formatEastmoneyTimestamp(ts int64) string {
+	if ts <= 0 {
+		return ""
+	}
+	text := strconv.FormatInt(ts, 10)
+	cst := time.FixedZone("CST", 8*60*60)
+	switch len(text) {
+	case 10:
+		return time.Unix(ts, 0).In(cst).Format("2006-01-02 15:04:05")
+	case 13:
+		return time.UnixMilli(ts).In(cst).Format("2006-01-02 15:04:05")
+	case 12:
+		if t, err := time.Parse("200601021504", text); err == nil {
+			return t.Format("2006-01-02 15:04")
+		}
+	case 14:
+		if t, err := time.Parse("20060102150405", text); err == nil {
+			return t.Format("2006-01-02 15:04:05")
+		}
+	case 8:
+		if t, err := time.Parse("20060102", text); err == nil {
+			return t.Format("2006-01-02")
+		}
+	}
+	return text
+}
+
+func parseTradePeriods(value any) models.TradePeriods {
+	raw, ok := value.(map[string]any)
+	if !ok || raw == nil {
+		return models.TradePeriods{}
+	}
+
+	result := models.TradePeriods{
+		Pre:   parseTradePeriod(raw["pre"]),
+		After: parseTradePeriod(raw["after"]),
+	}
+	for _, item := range toSliceAnyLocal(raw["periods"]) {
+		if period := parseTradePeriod(item); period != nil {
+			result.Periods = append(result.Periods, *period)
+		}
+	}
+	return result
+}
+
+func parseTradePeriod(value any) *models.TradePeriod {
+	raw, ok := value.(map[string]any)
+	if !ok || raw == nil {
+		return nil
+	}
+	begin := toInt64Any(raw["b"])
+	end := toInt64Any(raw["e"])
+	if begin == 0 && end == 0 {
+		return nil
+	}
+	return &models.TradePeriod{Begin: begin, End: end}
+}
+
+func toSliceAnyLocal(value any) []any {
+	switch v := value.(type) {
+	case []any:
+		return v
+	case []string:
+		result := make([]any, 0, len(v))
+		for _, item := range v {
+			result = append(result, item)
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func toMapSliceLocal(items []any) []map[string]any {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		switch row := item.(type) {
+		case map[string]any:
+			result = append(result, row)
+		case []any:
+			for _, nested := range row {
+				if nestedRow, ok := nested.(map[string]any); ok {
+					result = append(result, nestedRow)
+				}
+			}
+		}
+	}
+	return result
+}
+
+func toStringSlice(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return v
+	case []any:
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				result = append(result, str)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func parseFloat64Safe(value string) float64 {
+	f, _ := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	return f
+}
+
+func toStringLocal(value any) string {
+	if value == nil {
+		return ""
+	}
+	if v, ok := value.(string); ok {
+		return v
+	}
+	return fmt.Sprintf("%v", value)
+}
+
+func toFloat64Any(value any) float64 {
+	switch v := value.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case int32:
+		return float64(v)
+	case json.Number:
+		f, _ := v.Float64()
+		return f
+	case string:
+		return parseFloat64Safe(v)
+	default:
+		return parseFloat64Safe(toStringLocal(value))
+	}
+}
+
+func toInt64Any(value any) int64 {
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case float32:
+		return int64(v)
+	case json.Number:
+		i, _ := v.Int64()
+		return i
+	case string:
+		i, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return i
+	default:
+		i, _ := strconv.ParseInt(strings.TrimSpace(toStringLocal(value)), 10, 64)
+		return i
+	}
+}
+
+func (ms *MarketService) fetchMarketJSON(urlStr string, headers map[string]string) (map[string]any, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		result, err := ms.fetchMarketJSONOnce(urlStr, headers)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		time.Sleep(time.Duration(attempt+1) * 250 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+func (ms *MarketService) fetchMarketJSONOnce(urlStr string, headers map[string]string) (map[string]any, error) {
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := ms.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if isHTMLBody(body) {
+		return nil, fmt.Errorf("上游返回HTML响应，可能被拦截或接口变更")
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

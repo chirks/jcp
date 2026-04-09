@@ -4,25 +4,46 @@ package models
 type AIProvider string
 
 const (
-	AIProviderOpenAI   AIProvider = "openai"
-	AIProviderGemini   AIProvider = "gemini"
-	AIProviderVertexAI AIProvider = "vertexai"
+	AIProviderOpenAI    AIProvider = "openai"
+	AIProviderGemini    AIProvider = "gemini"
+	AIProviderVertexAI  AIProvider = "vertexai"
+	AIProviderAnthropic AIProvider = "anthropic"
+)
+
+type OpenAITokenParamMode string
+
+const (
+	OpenAITokenParamAuto                OpenAITokenParamMode = "auto"
+	OpenAITokenParamMaxTokens           OpenAITokenParamMode = "max_tokens"
+	OpenAITokenParamMaxCompletionTokens OpenAITokenParamMode = "max_completion_tokens"
+)
+
+// AgentSelectionStyle 小韭菜选人风格
+type AgentSelectionStyle string
+
+const (
+	AgentSelectionBalanced     AgentSelectionStyle = "balanced"
+	AgentSelectionConservative AgentSelectionStyle = "conservative"
+	AgentSelectionAggressive   AgentSelectionStyle = "aggressive"
 )
 
 // AIConfig AI服务配置
 type AIConfig struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Provider    AIProvider `json:"provider"`
-	BaseURL     string     `json:"baseUrl"`
-	APIKey      string     `json:"apiKey"`
-	ModelName   string     `json:"modelName"`
-	MaxTokens   int        `json:"maxTokens"`
-	Temperature float64    `json:"temperature"`
-	Timeout     int        `json:"timeout"`
-	IsDefault   bool       `json:"isDefault"`
+	ID             string               `json:"id"`
+	Name           string               `json:"name"`
+	Provider       AIProvider           `json:"provider"`
+	BaseURL        string               `json:"baseUrl"`
+	APIKey         string               `json:"apiKey"`
+	ModelName      string               `json:"modelName"`
+	MaxTokens      int                  `json:"maxTokens"`
+	TokenParamMode OpenAITokenParamMode `json:"tokenParamMode"`
+	Temperature    float64              `json:"temperature"`
+	Timeout        int                  `json:"timeout"`
+	IsDefault      bool                 `json:"isDefault"`
 	// OpenAI Responses API 开关
 	UseResponses bool `json:"useResponses"`
+	// 不支持 system role（自动检测，用户不可见）
+	NoSystemRole bool `json:"noSystemRole"`
 	// Vertex AI 专用字段
 	Project         string `json:"project"`
 	Location        string `json:"location"`
@@ -43,21 +64,31 @@ type MCPServerConfig struct {
 	ID            string           `json:"id"`
 	Name          string           `json:"name"`
 	TransportType MCPTransportType `json:"transportType"`
-	Endpoint      string           `json:"endpoint"`      // HTTP/SSE 端点 URL
-	Command       string           `json:"command"`       // 命令行传输的命令
-	Args          []string         `json:"args"`          // 命令行参数
-	ToolFilter    []string         `json:"toolFilter"`    // 工具过滤列表（空则全部）
-	Enabled       bool             `json:"enabled"`       // 是否启用
+	Endpoint      string           `json:"endpoint"`   // HTTP/SSE 端点 URL
+	Command       string           `json:"command"`    // 命令行传输的命令
+	Args          []string         `json:"args"`       // 命令行参数
+	ToolFilter    []string         `json:"toolFilter"` // 工具过滤列表（空则全部）
+	Enabled       bool             `json:"enabled"`    // 是否启用
 }
 
 // AppConfig 应用配置
 type AppConfig struct {
-	Theme       string            `json:"theme"` // 主题色: military, ocean, purple, orange, dark
-	AIConfigs   []AIConfig        `json:"aiConfigs"`
-	DefaultAIID string            `json:"defaultAiId"`
-	MCPServers  []MCPServerConfig `json:"mcpServers"` // MCP服务器配置列表
-	Memory      MemoryConfig      `json:"memory"`     // 记忆管理配置
-	Proxy       ProxyConfig       `json:"proxy"`      // 代理配置
+	Theme               string              `json:"theme"`           // 主题色: military, ocean, purple, orange, dark
+	CandleColorMode     string              `json:"candleColorMode"` // 涨跌颜色模式: red-up(红涨绿跌) / green-up(绿涨红跌)
+	AIConfigs           []AIConfig          `json:"aiConfigs"`
+	DefaultAIID         string              `json:"defaultAiId"`
+	StrategyAIID        string              `json:"strategyAiId"`  // 策略生成用AI
+	ModeratorAIID       string              `json:"moderatorAiId"` // 意图分析(小韭菜)用AI
+	AIRetryCount        int                 `json:"aiRetryCount"`
+	VerboseAgentIO      bool                `json:"verboseAgentIO"`
+	AgentSelectionStyle AgentSelectionStyle `json:"agentSelectionStyle"`
+	EnableSecondReview  bool                `json:"enableSecondReview"`
+	MCPServers          []MCPServerConfig   `json:"mcpServers"` // MCP服务器配置列表
+	Memory              MemoryConfig        `json:"memory"`     // 记忆管理配置
+	Proxy               ProxyConfig         `json:"proxy"`      // 代理配置
+	Layout              LayoutConfig        `json:"layout"`     // 界面布局配置
+	OpenClaw            OpenClawConfig      `json:"openClaw"`   // OpenClaw 服务配置
+	Indicators          IndicatorConfig     `json:"indicators"` // 技术指标配置
 }
 
 // ProxyMode 代理模式
@@ -83,4 +114,65 @@ type MemoryConfig struct {
 	MaxKeyFacts       int    `json:"maxKeyFacts"`       // 最大关键事实数
 	MaxSummaryLength  int    `json:"maxSummaryLength"`  // 摘要最大字数
 	CompressThreshold int    `json:"compressThreshold"` // 触发压缩的轮次数
+}
+
+// LayoutConfig 界面布局配置
+type LayoutConfig struct {
+	LeftPanelWidth    int `json:"leftPanelWidth"`    // 左侧面板宽度(px)
+	RightPanelWidth   int `json:"rightPanelWidth"`   // 右侧面板宽度(px)
+	BottomPanelHeight int `json:"bottomPanelHeight"` // 底部面板高度(px)
+	WindowWidth       int `json:"windowWidth"`       // 窗口宽度(px)
+	WindowHeight      int `json:"windowHeight"`      // 窗口高度(px)
+}
+
+// OpenClawConfig OpenClaw 服务配置
+type OpenClawConfig struct {
+	Enabled bool   `json:"enabled"` // 是否启用
+	Port    int    `json:"port"`    // 监听端口
+	APIKey  string `json:"apiKey"`  // API 鉴权密钥（可选）
+}
+
+// IndicatorConfig 技术指标配置
+type IndicatorConfig struct {
+	MA   MAConfig   `json:"ma"`
+	EMA  EMAConfig  `json:"ema"`
+	BOLL BOLLConfig `json:"boll"`
+	MACD MACDConfig `json:"macd"`
+	RSI  RSIConfig  `json:"rsi"`
+	KDJ  KDJConfig  `json:"kdj"`
+}
+
+type MAConfig struct {
+	Enabled bool  `json:"enabled"`
+	Periods []int `json:"periods"` // 默认 [5, 10, 20]
+}
+
+type EMAConfig struct {
+	Enabled bool  `json:"enabled"`
+	Periods []int `json:"periods"` // 默认 [12, 26]
+}
+
+type BOLLConfig struct {
+	Enabled    bool    `json:"enabled"`
+	Period     int     `json:"period"`     // 默认 20
+	Multiplier float64 `json:"multiplier"` // 默认 2.0
+}
+
+type MACDConfig struct {
+	Enabled bool `json:"enabled"`
+	Fast    int  `json:"fast"`   // 默认 12
+	Slow    int  `json:"slow"`   // 默认 26
+	Signal  int  `json:"signal"` // 默认 9
+}
+
+type RSIConfig struct {
+	Enabled bool `json:"enabled"`
+	Period  int  `json:"period"` // 默认 14
+}
+
+type KDJConfig struct {
+	Enabled bool `json:"enabled"`
+	Period  int  `json:"period"` // 默认 9
+	K       int  `json:"k"`      // 默认 3
+	D       int  `json:"d"`      // 默认 3
 }
